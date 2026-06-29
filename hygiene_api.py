@@ -141,6 +141,13 @@ def validate(payload: ValidatePayload):
             "is_done": True}
 
 
+@app.get("/validations")
+def validations_all(brand: Optional[str] = None):
+    """Every full validation record (all users) so the app can show/export the
+    whole team's work, not just the local browser's."""
+    return db.list_all_validations(brand=brand)
+
+
 @app.get("/validation/{asin}")
 def validation(asin: str):
     return db.get_validation(asin)

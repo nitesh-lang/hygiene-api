@@ -524,6 +524,41 @@ def list_done_asins():
         conn.close()
 
 
+def list_all_validations(brand=None):
+    """Return EVERY validation record (full details) so any user can export the
+    whole team's work. Each row: asin, brand, validated_by, validated_at,
+    check_results (parsed), notes."""
+    init_validations()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        if brand:
+            like = f"%{brand.lower()}%"
+            cur.execute(
+                f"SELECT asin, brand, is_done, validated_by, validated_at, "
+                f"check_results, notes FROM validations "
+                f"WHERE is_done='yes' AND LOWER(brand) LIKE {PLACEHOLDER}", (like,))
+        else:
+            cur.execute(
+                "SELECT asin, brand, is_done, validated_by, validated_at, "
+                "check_results, notes FROM validations WHERE is_done='yes'")
+        out = []
+        for r in cur.fetchall():
+            d = dict(r) if isinstance(r, dict) else {
+                "asin": r[0], "brand": r[1], "is_done": r[2],
+                "validated_by": r[3], "validated_at": r[4],
+                "check_results": r[5], "notes": r[6],
+            }
+            try:
+                d["check_results"] = json.loads(d.get("check_results") or "{}")
+            except Exception:
+                pass
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
 def validation_progress(brand=None):
     """Progress summary: how many ASINs done vs total, and per-validator counts.
 
