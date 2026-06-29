@@ -604,13 +604,92 @@ def import_csv(path, crawl_run=None):
     return n
 
 
+
+
+# --------------------------------------------------------------------------
+# Input sheet (validator reference values) — stored as JSON rows so the app
+# can load it from the backend instead of every user uploading the xlsx.
+# --------------------------------------------------------------------------
+def init_input_sheet():
+    """Create the input_sheet table. One row per (sheet upload) is overkill;
+    we store the whole sheet as JSON under a single current row + keep history."""
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS input_sheet (
+            id {SERIAL},
+            uploaded_at {TEXT},
+            sheet_name {TEXT},
+            columns_json {TEXT},
+            rows_json {TEXT},
+            is_current {TEXT}
+        );
+        """)
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_input_current ON input_sheet (is_current);')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_input_sheet(columns, rows, sheet_name="Format"):
+    """Replace the current input sheet. columns=list[str], rows=list[dict]."""
+    init_input_sheet()
+    now = datetime.now(timezone.utc).isoformat()
+    cols_json = json.dumps(list(columns), ensure_ascii=False)
+    rows_json = json.dumps(rows, ensure_ascii=False)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        # demote previous current rows
+        cur.execute("UPDATE input_sheet SET is_current = 'no' WHERE is_current = 'yes'")
+        fields = ["uploaded_at", "sheet_name", "columns_json", "rows_json", "is_current"]
+        quoted = ", ".join(f'"{f}"' for f in fields)
+        marks = ", ".join([PLACEHOLDER] * len(fields))
+        cur.execute(
+            f'INSERT INTO input_sheet ({quoted}) VALUES ({marks})',
+            [now, sheet_name, cols_json, rows_json, "yes"],
+        )
+        conn.commit()
+        return len(rows)
+    finally:
+        conn.close()
+
+
+def get_input_sheet():
+    """Return the current input sheet as {sheet_name, columns, rows, uploaded_at}
+    or None if none uploaded yet."""
+    init_input_sheet()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT uploaded_at, sheet_name, columns_json, rows_json "
+                    "FROM input_sheet WHERE is_current = 'yes' "
+                    "ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if not row:
+            return None
+        d = dict(row) if isinstance(row, dict) else {
+            "uploaded_at": row[0], "sheet_name": row[1],
+            "columns_json": row[2], "rows_json": row[3],
+        }
+        return {
+            "uploaded_at": d.get("uploaded_at"),
+            "sheet_name": d.get("sheet_name"),
+            "columns": json.loads(d.get("columns_json") or "[]"),
+            "rows": json.loads(d.get("rows_json") or "[]"),
+        }
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
-        print("Commands: init | import-csv <path> | show <asin> | run <crawl_run> | stats")
+        print("Commands: init | import-csv <path> | import-input <path.xlsx> [sheet] | show-input | show <asin> | run <crawl_run> | stats")
         print("Backend:", backend_name())
         sys.exit(0)
 
@@ -641,5 +720,23 @@ if __name__ == "__main__":
         print(f"Marked {args[1]} done by {args[2]}")
     elif cmd == "check-done":
         print(args[1], "->", "DONE" if is_done(args[1]) else "not done")
+    elif cmd == "import-input":
+        # python hygiene_db.py import-input <path.xlsx> [sheet_name]
+        import pandas as pd
+        path = args[1]
+        sheet = args[2] if len(args) > 2 else 0
+        df = pd.read_excel(path, sheet_name=sheet, dtype=str).fillna("")
+        cols = list(df.columns)
+        rows = df.to_dict(orient="records")
+        n = save_input_sheet(cols, rows,
+                             sheet_name=(sheet if isinstance(sheet, str) else "Format"))
+        print(f"Imported input sheet: {n} rows, {len(cols)} cols into {backend_name()}")
+    elif cmd == "show-input":
+        d = get_input_sheet()
+        if not d:
+            print("No input sheet stored.")
+        else:
+            print(f"sheet={d['sheet_name']} rows={len(d['rows'])} "
+                  f"cols={len(d['columns'])} uploaded_at={d['uploaded_at']}")
     else:
         print("Unknown command:", cmd)

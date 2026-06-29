@@ -62,6 +62,7 @@ def _startup():
     try:
         db.init_db()
         db.init_validations()
+        db.init_input_sheet()
     except Exception as e:
         # don't crash the service; /health will report the backend
         print("startup init warning:", e)
@@ -139,6 +140,13 @@ def validate(payload: ValidatePayload):
     return {"ok": True, "asin": payload.asin,
             "validated_by": payload.validated_by,
             "is_done": True}
+
+
+@app.get("/input")
+def input_sheet():
+    """The current validator input/reference sheet (loaded from backend so users
+    don't upload the xlsx). Returns {sheet_name, columns, rows} or null."""
+    return db.get_input_sheet()
 
 
 @app.get("/validations")
