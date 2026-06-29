@@ -92,7 +92,9 @@ if _IS_PG:
     import psycopg2.extras
 
     def _connect():
-        return psycopg2.connect(DATABASE_URL)
+        conn = psycopg2.connect(DATABASE_URL)
+        conn.cursor_factory = psycopg2.extras.RealDictCursor
+        return conn
 
     PLACEHOLDER = "%s"
     SERIAL = "SERIAL PRIMARY KEY"
@@ -119,6 +121,16 @@ else:
 
 def backend_name():
     return "postgres" if _IS_PG else f"sqlite ({SQLITE_PATH})"
+
+
+def _scalar(row):
+    """Return the first/only value from a fetched row, whether the row is a
+    tuple (sqlite / plain cursor) or a dict (psycopg2 RealDictCursor)."""
+    if row is None:
+        return None
+    if isinstance(row, dict):
+        return next(iter(row.values()))
+    return row[0]
 
 
 # --------------------------------------------------------------------------
@@ -354,11 +366,11 @@ def stats():
     try:
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM products")
-        total = cur.fetchone()[0]
+        total = _scalar(cur.fetchone())
         cur.execute("SELECT COUNT(DISTINCT asin) FROM products")
-        asins = cur.fetchone()[0]
+        asins = _scalar(cur.fetchone())
         cur.execute("SELECT COUNT(DISTINCT crawl_run) FROM products")
-        runs = cur.fetchone()[0]
+        runs = _scalar(cur.fetchone())
         return {"backend": backend_name(), "total_rows": total,
                 "distinct_asins": asins, "crawl_runs": runs}
     finally:
@@ -472,7 +484,7 @@ def is_done(asin):
             (str(asin).strip(),),
         )
         row = cur.fetchone()
-        return bool(row) and (dict(row).get("is_done") if not _IS_PG else row[0]) == "yes"
+        return _scalar(row) == "yes"
     finally:
         conn.close()
 
@@ -507,7 +519,7 @@ def list_done_asins():
     try:
         cur = conn.cursor()
         cur.execute("SELECT asin FROM validations WHERE is_done = 'yes'")
-        return {(r[0] if not _IS_PG else r["asin"]) for r in cur.fetchall()}
+        return {_scalar(r) for r in cur.fetchall()}
     finally:
         conn.close()
 
@@ -532,8 +544,14 @@ def validation_progress(brand=None):
         else:
             cur.execute("SELECT validated_by, COUNT(*) FROM validations "
                         "WHERE is_done='yes' GROUP BY validated_by")
-        by_person = {(r[0] if not _IS_PG else r["validated_by"]):
-                     (r[1] if not _IS_PG else r["count"]) for r in cur.fetchall()}
+        by_person = {}
+        for r in cur.fetchall():
+            if isinstance(r, dict):
+                vals = list(r.values())
+                name, count = vals[0], vals[1]
+            else:
+                name, count = r[0], r[1]
+            by_person[name] = count
         done = sum(by_person.values())
         return {"total": total, "done": done, "remaining": total - done,
                 "by_validator": by_person}
