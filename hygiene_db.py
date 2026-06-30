@@ -683,6 +683,25 @@ def get_input_sheet():
         conn.close()
 
 
+
+def clear_validations():
+    """Delete ALL validation records (and history) so the team starts fresh at 0.
+    Products and input sheet are untouched."""
+    init_validations()
+    conn=_connect()
+    try:
+        cur=conn.cursor()
+        cur.execute("DELETE FROM validations")
+        try:
+            cur.execute("DELETE FROM validations_history")
+        except Exception:
+            pass
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -731,6 +750,9 @@ if __name__ == "__main__":
         n = save_input_sheet(cols, rows,
                              sheet_name=(sheet if isinstance(sheet, str) else "Format"))
         print(f"Imported input sheet: {n} rows, {len(cols)} cols into {backend_name()}")
+    elif cmd == "clear-validations":
+        clear_validations()
+        print(f"Cleared ALL validations into {backend_name()} — everyone starts at 0.")
     elif cmd == "show-input":
         d = get_input_sheet()
         if not d:
