@@ -33,16 +33,41 @@ Endpoints (all JSON):
 import os
 from typing import Optional, Any, Dict, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import hygiene_db as db
 
 app = FastAPI(title="Hygiene Validator API", version="1.0")
 
-# Allow the React app (any origin during setup; lock down later if you want).
-# To restrict: set ALLOWED_ORIGINS="https://your-validator.onrender.com,https://..."
+# ── AUTH ─────────────────────────────────────────────────────────────────────
+# Every data route requires the shared key in the `x-api-key` header. Set it on
+# Render:  API_KEY=<same value the frontend's VITE_API_KEY uses>.
+# Fail-open ONLY while API_KEY is unset, so deploying this code BEFORE you set the
+# env var can't lock anyone out — but the API is NOT protected until API_KEY is set.
+API_KEY = os.environ.get("API_KEY", "").strip()
+_OPEN_PATHS = {"/", "/health"}  # never require the key (health checks)
+
+
+@app.middleware("http")
+async def require_api_key(request: Request, call_next):
+    if request.method == "OPTIONS":           # CORS preflight carries no auth header
+        return await call_next(request)
+    if request.url.path in _OPEN_PATHS:       # health checks must stay open for Render
+        return await call_next(request)
+    if API_KEY and request.headers.get("x-api-key") != API_KEY:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+# ── CORS ─────────────────────────────────────────────────────────────────────
+# Lock to your frontend origin:  ALLOWED_ORIGINS="https://your-validator.onrender.com"
+# allow_credentials is now False (we authenticate with a header key, not cookies),
+# which also closes the previous reflect-ANY-origin-with-credentials hole.
+# Added AFTER the auth middleware so CORS is the OUTERMOST layer: preflight is
+# answered correctly and even a 401 response still carries CORS headers.
 _origins_env = os.environ.get("ALLOWED_ORIGINS", "*")
 _origins = ["*"] if _origins_env.strip() == "*" else [
     o.strip() for o in _origins_env.split(",") if o.strip()
@@ -50,9 +75,9 @@ _origins = ["*"] if _origins_env.strip() == "*" else [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "x-api-key"],
 )
 
 

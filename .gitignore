@@ -1,0 +1,44 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Hygiene API — protect secrets & runtime data from ever being committed.
+# Only the source files (hygiene_api.py, hygiene_db.py, requirements.txt,
+# DB_SETUP.md) belong in this repo. Everything below is data, secrets, or junk.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Secrets / environment
+.env
+.env.*
+!.env.example
+
+# Browser session — CONTAINS LOGIN COOKIES. Never commit.
+browser_profile/
+
+# Database & crawl output (business data + PII)
+output/
+*.db
+*.sqlite
+*.sqlite3
+checkpoint.json
+html/
+
+# Input / reference spreadsheets (supplier contacts, fees)
+Input/
+*.xlsx
+*.xls
+*.csv
+~$*
+
+# The frontend is its own repo — don't nest-commit it here
+hygiene-app/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
