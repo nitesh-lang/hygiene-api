@@ -14,7 +14,22 @@ $ErrorActionPreference = "Stop"
 Set-Location -Path $PSScriptRoot
 
 # Point at the SHARED Render database (not a local file).
-$env:DATABASE_URL = "postgresql://hygiene_db_91nz_user:fn7FDChr8tiVvJiOLrrKyXUvF6SuEWRv@dpg-d911i9j7uimc739q59b0-a.singapore-postgres.render.com/hygiene_db_91nz"
+# The connection string is a SECRET — it is NEVER hardcoded here.
+# Provide it in ONE of two ways (both kept OUT of git):
+#   1. Set an environment variable before running:
+#        $env:DATABASE_URL = "postgresql://USER:PASSWORD@HOST/DBNAME"
+#   2. OR create a local, git-ignored file next to this script named
+#      "deploy.secrets.ps1" containing that single line above. It will be
+#      loaded automatically. (deploy.secrets.ps1 is in .gitignore.)
+if (-not $env:DATABASE_URL) {
+    $secretsFile = Join-Path $PSScriptRoot "deploy.secrets.ps1"
+    if (Test-Path $secretsFile) { . $secretsFile }
+}
+if (-not $env:DATABASE_URL) {
+    Write-Host "ERROR: DATABASE_URL is not set." -ForegroundColor Red
+    Write-Host "Set `$env:DATABASE_URL, or create a local deploy.secrets.ps1 (see comments above)." -ForegroundColor Yellow
+    exit 1
+}
 
 $csv   = "output\amazon_products_full.csv"
 $input = "output\All Brands Hygiene Input file - 2026.xlsx"

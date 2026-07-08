@@ -8,6 +8,7 @@
 .env
 .env.*
 !.env.example
+deploy.secrets.ps1
 
 # Browser session — CONTAINS LOGIN COOKIES. Never commit.
 browser_profile/
