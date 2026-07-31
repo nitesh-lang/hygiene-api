@@ -96,7 +96,11 @@ app.add_middleware(
     allow_origins=_origins,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "x-api-key"],
+    # Authorization MUST be here: every signed-in request carries the bearer
+    # token in it, and a header missing from this list makes the browser fail
+    # the preflight before the request is ever sent — which surfaces as
+    # "can't reach the server", not as a 401.
+    allow_headers=["Content-Type", "x-api-key", "Authorization"],
 )
 
 
