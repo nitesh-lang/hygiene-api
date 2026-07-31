@@ -65,15 +65,20 @@ async def require_api_key(request: Request, call_next):
     if request.url.path in _OPEN_PATHS:       # health checks must stay open for Render
         return await call_next(request)
     # A signed-in user's bearer token is accepted anywhere the shared key is.
-    # Both are allowed during the migration off the in-bundle key: the browser
-    # can switch to tokens without a flag-day that locks the team out. Once no
-    # client sends x-api-key any more, drop the API_KEY branch below.
+    # Both are allowed during the migration off the in-bundle key so the browser
+    # can switch to tokens without a flag-day that locks the team out; once no
+    # client sends x-api-key, unset API_KEY and only tokens will work.
+    #
+    # Deny by default. This used to fall through to call_next() whenever API_KEY
+    # was empty, so an unset or mistyped env var silently published the entire
+    # database to anyone who knew the URL. Now a caller must present something
+    # valid, and clearing API_KEY tightens the API instead of opening it.
     token = _bearer(request)
     if token and db.session_user(token):
         return await call_next(request)
-    if API_KEY and request.headers.get("x-api-key") != API_KEY:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return await call_next(request)
+    if API_KEY and request.headers.get("x-api-key") == API_KEY:
+        return await call_next(request)
+    return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
