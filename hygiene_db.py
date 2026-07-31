@@ -732,16 +732,18 @@ def init_users():
             pw_hash {TEXT},
             is_admin {TEXT},
             created_at {TEXT},
-            must_change {TEXT}
+            must_change {TEXT},
+            email {TEXT}
         );
         """)
-        # Older installs predate must_change. SQLite has no ADD COLUMN IF NOT
-        # EXISTS, so just try it and accept the failure when it's already there.
-        try:
-            cur.execute(f'ALTER TABLE users ADD COLUMN must_change {TEXT}')
-            conn.commit()
-        except Exception:
-            conn.rollback()
+        # Older installs predate must_change/email. SQLite has no ADD COLUMN IF
+        # NOT EXISTS, so try each and accept failure when it's already there.
+        for col in ("must_change", "email"):
+            try:
+                cur.execute(f'ALTER TABLE users ADD COLUMN {col} {TEXT}')
+                conn.commit()
+            except Exception:
+                conn.rollback()
         cur.execute(f"""
         CREATE TABLE IF NOT EXISTS sessions (
             token {TEXT} PRIMARY KEY,
@@ -759,34 +761,56 @@ def init_users():
 MIN_PASSWORD_LEN = 8
 
 
-def create_user(name, password, is_admin=False, must_change=True):
+def create_user(name, password, is_admin=False, must_change=True, email=None):
     """Add or replace a user.
 
     must_change defaults to True: a password someone else typed is a temporary
     one, and the owner should replace it before doing any work. It is cleared
     only by set_own_password().
+
+    email=None on an existing user keeps whatever address is already stored, so
+    a password change never silently drops someone's login address.
     """
     name = str(name).strip()
     if not name or not password:
         raise ValueError("name and password are required")
     init_users()
+    if email is None:
+        prev = _user_row(name)
+        email = (prev or {}).get("email") or ""
+    email = str(email).strip().lower()
     conn = _connect()
     try:
         cur = conn.cursor()
         row = [name, _hash_password(password), "yes" if is_admin else "no",
-               datetime.now(timezone.utc).isoformat(), "yes" if must_change else "no"]
+               datetime.now(timezone.utc).isoformat(),
+               "yes" if must_change else "no", email]
         if _IS_PG:
             cur.execute(
-                'INSERT INTO users (name, pw_hash, is_admin, created_at, must_change) '
-                'VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET '
+                'INSERT INTO users (name, pw_hash, is_admin, created_at, must_change, email) '
+                'VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET '
                 'pw_hash=EXCLUDED.pw_hash, is_admin=EXCLUDED.is_admin, '
-                'must_change=EXCLUDED.must_change', row)
+                'must_change=EXCLUDED.must_change, email=EXCLUDED.email', row)
         else:
             cur.execute('INSERT OR REPLACE INTO users '
-                        '(name, pw_hash, is_admin, created_at, must_change) '
-                        'VALUES (?,?,?,?,?)', row)
+                        '(name, pw_hash, is_admin, created_at, must_change, email) '
+                        'VALUES (?,?,?,?,?,?)', row)
         conn.commit()
         return name
+    finally:
+        conn.close()
+
+
+def set_email(name, email):
+    """Attach a login email to an existing user."""
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'UPDATE users SET email = {PLACEHOLDER} WHERE name = {PLACEHOLDER}',
+                    (str(email).strip().lower(), str(name).strip()))
+        conn.commit()
+        return cur.rowcount
     finally:
         conn.close()
 
@@ -802,7 +826,10 @@ def set_own_password(name, current_password, new_password):
     user = verify_user(name, current_password)
     if not user:
         raise PermissionError("Current password is incorrect.")
-    create_user(name, new_password, is_admin=user["is_admin"], must_change=False)
+    # Resolve to the canonical name — `name` may have arrived as an email.
+    name = user["name"]
+    create_user(name, new_password, is_admin=user["is_admin"], must_change=False,
+                email=user.get("email") or None)
     conn = _connect()
     try:
         cur = conn.cursor()
@@ -822,25 +849,53 @@ def _user_row(name):
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(f'SELECT name, pw_hash, is_admin, must_change FROM users '
+        cur.execute(f'SELECT name, pw_hash, is_admin, must_change, email FROM users '
                     f'WHERE name = {PLACEHOLDER}', (str(name).strip(),))
         r = cur.fetchone()
         if not r:
             return None
         if isinstance(r, dict):
             return dict(r)
-        return {"name": r[0], "pw_hash": r[1], "is_admin": r[2], "must_change": r[3]}
+        return {"name": r[0], "pw_hash": r[1], "is_admin": r[2],
+                "must_change": r[3], "email": r[4]}
     finally:
         conn.close()
 
 
-def verify_user(name, password):
-    """Return {name, is_admin} when the password matches, else None."""
+def _user_row_by_login(login):
+    """Resolve a sign-in identifier. Accepts the email address or the display
+    name, both case-insensitively — people type their name inconsistently and
+    an email is easier to remember than an exact spelling of 'Sagar Sakapl'."""
+    login = str(login or "").strip().lower()
+    if not login:
+        return None
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute('SELECT name, pw_hash, is_admin, must_change, email FROM users')
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        d = dict(r) if isinstance(r, dict) else {
+            "name": r[0], "pw_hash": r[1], "is_admin": r[2],
+            "must_change": r[3], "email": r[4]}
+        if str(d.get("email") or "").strip().lower() == login:
+            return d
+        if str(d.get("name") or "").strip().lower() == login:
+            return d
+    return None
+
+
+def verify_user(login, password):
+    """Return {name, email, is_admin, must_change} when the password matches
+    the account identified by `login` (email or name), else None."""
     init_users()
-    row = _user_row(name)
+    row = _user_row_by_login(login)
     if not row or not _verify_password(password or "", row.get("pw_hash")):
         return None
-    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes",
+    return {"name": row["name"], "email": row.get("email") or "",
+            "is_admin": row.get("is_admin") == "yes",
             "must_change": row.get("must_change") == "yes"}
 
 
@@ -849,12 +904,15 @@ def list_users():
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT name, is_admin, created_at, must_change FROM users ORDER BY name")
+        cur.execute("SELECT name, is_admin, created_at, must_change, email "
+                    "FROM users ORDER BY name")
         out = []
         for r in cur.fetchall():
             d = dict(r) if isinstance(r, dict) else {
-                "name": r[0], "is_admin": r[1], "created_at": r[2], "must_change": r[3]}
-            out.append({"name": d["name"], "is_admin": d.get("is_admin") == "yes",
+                "name": r[0], "is_admin": r[1], "created_at": r[2],
+                "must_change": r[3], "email": r[4]}
+            out.append({"name": d["name"], "email": d.get("email") or "",
+                        "is_admin": d.get("is_admin") == "yes",
                         "must_change": d.get("must_change") == "yes",
                         "created_at": d.get("created_at")})
         return out
@@ -1023,9 +1081,28 @@ if __name__ == "__main__":
             flags = []
             if u["is_admin"]:
                 flags.append("admin")
-            if u.get("must_change"):
-                flags.append("must set own password")
-            print(f"  {u['name']}{'  (' + ', '.join(flags) + ')' if flags else ''}")
+            flags.append("must set own password" if u.get("must_change")
+                         else "own password set")
+            em = u.get("email") or "NO EMAIL SET"
+            print(f"  {u['name']:<20} {em:<32} ({', '.join(flags)})")
+    elif cmd == "set-email":
+        # python hygiene_db.py set-email "Naresh More" naresh@cambiumretail.com
+        n = set_email(args[1], args[2])
+        print(f"{'Set' if n else 'NO SUCH USER:'} {args[1]} -> {args[2]}")
+    elif cmd == "reset-to-shared":
+        # python hygiene_db.py reset-to-shared <password> ["Name" ...]
+        # Puts the named users (or everyone) back on a shared first-time
+        # password and re-arms must_change, so each must pick their own again.
+        pw = args[1]
+        targets = args[2:] or [u["name"] for u in list_users()]
+        for n in targets:
+            row = _user_row(n)
+            if not row:
+                print(f"  no such user: {n}")
+                continue
+            create_user(n, pw, is_admin=row.get("is_admin") == "yes",
+                        must_change=True)
+            print(f"  {n} -> shared password, must set own at next login")
     elif cmd == "seed-users":
         # python hygiene_db.py seed-users "Name A" "Name B:admin" ...
         # Generates a temporary password for each and prints it ONCE. Every user

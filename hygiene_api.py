@@ -136,6 +136,8 @@ def health():
 
 # ── login ────────────────────────────────────────────────────────────────────
 class LoginPayload(BaseModel):
+    # Sign in with the work email; the display name is accepted too so an
+    # account still works before its address has been filled in.
     name: str
     password: str
 
@@ -157,7 +159,8 @@ def login(payload: LoginPayload):
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect name or password.")
     return {"token": db.create_session(user["name"]),
-            "name": user["name"], "admin": user["is_admin"],
+            "name": user["name"], "email": user.get("email", ""),
+            "admin": user["is_admin"],
             "must_change": user["must_change"]}
 
 
