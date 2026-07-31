@@ -48,7 +48,14 @@ app = FastAPI(title="Hygiene Validator API", version="1.0")
 # Fail-open ONLY while API_KEY is unset, so deploying this code BEFORE you set the
 # env var can't lock anyone out — but the API is NOT protected until API_KEY is set.
 API_KEY = os.environ.get("API_KEY", "").strip()
-_OPEN_PATHS = {"/", "/health"}  # never require the key (health checks)
+# Never require auth. /login MUST be here — it is how a caller obtains
+# credentials in the first place, so gating it behind them locks everyone out.
+_OPEN_PATHS = {"/", "/health", "/login"}
+
+
+def _bearer(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    return auth[7:].strip() if auth[:7].lower() == "bearer " else ""
 
 
 @app.middleware("http")
@@ -56,6 +63,13 @@ async def require_api_key(request: Request, call_next):
     if request.method == "OPTIONS":           # CORS preflight carries no auth header
         return await call_next(request)
     if request.url.path in _OPEN_PATHS:       # health checks must stay open for Render
+        return await call_next(request)
+    # A signed-in user's bearer token is accepted anywhere the shared key is.
+    # Both are allowed during the migration off the in-bundle key: the browser
+    # can switch to tokens without a flag-day that locks the team out. Once no
+    # client sends x-api-key any more, drop the API_KEY branch below.
+    token = _bearer(request)
+    if token and db.session_user(token):
         return await call_next(request)
     if API_KEY and request.headers.get("x-api-key") != API_KEY:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -88,6 +102,7 @@ def _startup():
         db.init_db()
         db.init_validations()
         db.init_input_sheet()
+        db.init_users()
     except Exception as e:
         # don't crash the service; /health will report the backend
         print("startup init warning:", e)
@@ -105,7 +120,60 @@ class ValidatePayload(BaseModel):
 # ---------------------------------------------------------------- routes
 @app.get("/health")
 def health():
-    return {"ok": True, "backend": db.backend_name()}
+    """Reports whether the DATABASE actually answers, not just which driver is
+    configured. The old version returned ok:true off the URL prefix alone, so
+    Render showed this service green through an outage in which every data
+    route was 500ing."""
+    try:
+        db.list_done_asins()
+        return {"ok": True, "backend": db.backend_name(), "db": "up"}
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "backend": db.backend_name(), "db": "down",
+             "error": type(e).__name__},
+            status_code=503)
+
+
+# ── login ────────────────────────────────────────────────────────────────────
+class LoginPayload(BaseModel):
+    name: str
+    password: str
+
+
+@app.post("/login")
+def login(payload: LoginPayload):
+    """Exchange name + password for a bearer token. The team's credentials used
+    to sit in plaintext inside the browser bundle; they're hashed in the DB now
+    and the browser only ever holds an opaque token."""
+    user = db.verify_user(payload.name, payload.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Incorrect name or password.")
+    return {"token": db.create_session(user["name"]),
+            "name": user["name"], "admin": user["is_admin"]}
+
+
+@app.post("/logout")
+def logout(request: Request):
+    token = _bearer(request)
+    if token:
+        db.delete_session(token)
+    return {"ok": True}
+
+
+@app.get("/me")
+def me(request: Request):
+    """Who the caller is. Returns null for a shared-key caller with no token,
+    which is how the client tells 'signed in' from 'using the legacy key'."""
+    return db.session_user(_bearer(request))
+
+
+@app.get("/users")
+def users(request: Request):
+    """Admin-only: the roster, never any hashes."""
+    who = db.session_user(_bearer(request))
+    if not who or not who.get("is_admin"):
+        raise HTTPException(status_code=403, detail="admin only")
+    return db.list_users()
 
 
 @app.get("/products")

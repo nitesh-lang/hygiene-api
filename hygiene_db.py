@@ -30,7 +30,10 @@ Standalone tools:
 import os
 import json
 import sys
-from datetime import datetime, timezone
+import hmac
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
 
 # The 48 crawler columns, in order. Kept here so the schema and the crawler
 # never drift apart — import this list in the crawler if you like.
@@ -684,6 +687,203 @@ def get_input_sheet():
 
 
 
+# --------------------------------------------------------------------------
+# Users & sessions
+# --------------------------------------------------------------------------
+# The validator's login used to be a plaintext table inside the React bundle,
+# which meant every teammate's password (and the admin flag) was readable by
+# anyone who opened the site's JavaScript. Passwords now live here, hashed, and
+# the browser is handed an opaque session token instead.
+#
+# PBKDF2-HMAC-SHA256 from the standard library — no new dependency to install on
+# Render, and correct for this purpose. Format: pbkdf2_sha256$rounds$salt$hash
+_PBKDF2_ROUNDS = 240_000
+
+
+def _hash_password(password, salt=None, rounds=_PBKDF2_ROUNDS):
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                             salt.encode("utf-8"), rounds)
+    return f"pbkdf2_sha256${rounds}${salt}${dk.hex()}"
+
+
+def _verify_password(password, stored):
+    """Constant-time check. Returns False for anything malformed rather than
+    raising, so a corrupt row can't turn into a 500 on the login route."""
+    try:
+        algo, rounds, salt, want = str(stored).split("$", 3)
+        if algo != "pbkdf2_sha256":
+            return False
+        got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                                  salt.encode("utf-8"), int(rounds)).hex()
+        return hmac.compare_digest(got, want)
+    except Exception:
+        return False
+
+
+def init_users():
+    """Create the users + sessions tables. Safe to call repeatedly."""
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS users (
+            name {TEXT} PRIMARY KEY,
+            pw_hash {TEXT},
+            is_admin {TEXT},
+            created_at {TEXT}
+        );
+        """)
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS sessions (
+            token {TEXT} PRIMARY KEY,
+            name {TEXT},
+            created_at {TEXT},
+            expires_at {TEXT}
+        );
+        """)
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_sess_name ON sessions (name);')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_user(name, password, is_admin=False):
+    """Add or replace a user. Returns the stored name."""
+    name = str(name).strip()
+    if not name or not password:
+        raise ValueError("name and password are required")
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        row = [name, _hash_password(password), "yes" if is_admin else "no",
+               datetime.now(timezone.utc).isoformat()]
+        if _IS_PG:
+            cur.execute(
+                'INSERT INTO users (name, pw_hash, is_admin, created_at) '
+                'VALUES (%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET '
+                'pw_hash=EXCLUDED.pw_hash, is_admin=EXCLUDED.is_admin', row)
+        else:
+            cur.execute('INSERT OR REPLACE INTO users '
+                        '(name, pw_hash, is_admin, created_at) VALUES (?,?,?,?)', row)
+        conn.commit()
+        return name
+    finally:
+        conn.close()
+
+
+def _user_row(name):
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT name, pw_hash, is_admin FROM users WHERE name = {PLACEHOLDER}',
+                    (str(name).strip(),))
+        r = cur.fetchone()
+        if not r:
+            return None
+        if isinstance(r, dict):
+            return dict(r)
+        return {"name": r[0], "pw_hash": r[1], "is_admin": r[2]}
+    finally:
+        conn.close()
+
+
+def verify_user(name, password):
+    """Return {name, is_admin} when the password matches, else None."""
+    init_users()
+    row = _user_row(name)
+    if not row or not _verify_password(password or "", row.get("pw_hash")):
+        return None
+    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes"}
+
+
+def list_users():
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name, is_admin, created_at FROM users ORDER BY name")
+        out = []
+        for r in cur.fetchall():
+            d = dict(r) if isinstance(r, dict) else {
+                "name": r[0], "is_admin": r[1], "created_at": r[2]}
+            out.append({"name": d["name"], "is_admin": d.get("is_admin") == "yes",
+                        "created_at": d.get("created_at")})
+        return out
+    finally:
+        conn.close()
+
+
+def delete_user(name):
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'DELETE FROM sessions WHERE name = {PLACEHOLDER}', (str(name).strip(),))
+        cur.execute(f'DELETE FROM users WHERE name = {PLACEHOLDER}', (str(name).strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def create_session(name, days=30):
+    """Issue an opaque bearer token. Old sessions stay valid until they expire."""
+    init_users()
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f'INSERT INTO sessions (token, name, created_at, expires_at) '
+            f'VALUES ({PLACEHOLDER},{PLACEHOLDER},{PLACEHOLDER},{PLACEHOLDER})',
+            (token, str(name).strip(), now.isoformat(),
+             (now + timedelta(days=days)).isoformat()))
+        conn.commit()
+        return token
+    finally:
+        conn.close()
+
+
+def session_user(token):
+    """Resolve a bearer token to {name, is_admin}, or None if unknown/expired."""
+    if not token:
+        return None
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT name, expires_at FROM sessions WHERE token = {PLACEHOLDER}',
+                    (str(token).strip(),))
+        r = cur.fetchone()
+        if not r:
+            return None
+        d = dict(r) if isinstance(r, dict) else {"name": r[0], "expires_at": r[1]}
+        try:
+            if datetime.fromisoformat(d["expires_at"]) < datetime.now(timezone.utc):
+                return None
+        except Exception:
+            return None
+    finally:
+        conn.close()
+    row = _user_row(d["name"])
+    if not row:
+        return None
+    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes"}
+
+
+def delete_session(token):
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'DELETE FROM sessions WHERE token = {PLACEHOLDER}', (str(token).strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def clear_validations():
     """Delete ALL validation records (and history) so the team starts fresh at 0.
     Products and input sheet are untouched."""
@@ -753,6 +953,29 @@ if __name__ == "__main__":
     elif cmd == "clear-validations":
         clear_validations()
         print(f"Cleared ALL validations into {backend_name()} — everyone starts at 0.")
+    elif cmd == "add-user":
+        # python hygiene_db.py add-user "Naresh More" <password> [admin]
+        # Passwords are hashed here and never stored or shipped in plaintext.
+        is_admin = len(args) > 3 and args[3].lower() in ("admin", "yes", "true", "1")
+        create_user(args[1], args[2], is_admin=is_admin)
+        print(f"User '{args[1]}' saved{' (admin)' if is_admin else ''} in {backend_name()}")
+    elif cmd == "set-password":
+        # python hygiene_db.py set-password "Naresh More" <new-password>
+        existing = _user_row(args[1])
+        if not existing:
+            print(f"No such user: {args[1]}")
+        else:
+            create_user(args[1], args[2], is_admin=existing.get("is_admin") == "yes")
+            print(f"Password updated for '{args[1]}'")
+    elif cmd == "list-users":
+        us = list_users()
+        if not us:
+            print("No users yet. Add one:  python hygiene_db.py add-user \"Name\" <password> [admin]")
+        for u in us:
+            print(f"  {u['name']}{'  (admin)' if u['is_admin'] else ''}")
+    elif cmd == "del-user":
+        delete_user(args[1])
+        print(f"Removed user '{args[1]}' and any active sessions")
     elif cmd == "show-input":
         d = get_input_sheet()
         if not d:
