@@ -140,16 +140,42 @@ class LoginPayload(BaseModel):
     password: str
 
 
+class ChangePasswordPayload(BaseModel):
+    current_password: str
+    new_password: str
+
+
 @app.post("/login")
 def login(payload: LoginPayload):
     """Exchange name + password for a bearer token. The team's credentials used
     to sit in plaintext inside the browser bundle; they're hashed in the DB now
-    and the browser only ever holds an opaque token."""
+    and the browser only ever holds an opaque token.
+
+    must_change=True means the password was issued by someone else and the user
+    has to replace it before working — the client gates the app on this."""
     user = db.verify_user(payload.name, payload.password)
     if not user:
         raise HTTPException(status_code=401, detail="Incorrect name or password.")
     return {"token": db.create_session(user["name"]),
-            "name": user["name"], "admin": user["is_admin"]}
+            "name": user["name"], "admin": user["is_admin"],
+            "must_change": user["must_change"]}
+
+
+@app.post("/change-password")
+def change_password(payload: ChangePasswordPayload, request: Request):
+    """Set your own password. Requires the current one, so a stolen token can't
+    be used to take over the account. Every session is dropped afterwards,
+    including this one, so the client logs back in with the new password."""
+    who = db.session_user(_bearer(request))
+    if not who:
+        raise HTTPException(status_code=401, detail="Sign in first.")
+    try:
+        db.set_own_password(who["name"], payload.current_password, payload.new_password)
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "name": who["name"]}
 
 
 @app.post("/logout")

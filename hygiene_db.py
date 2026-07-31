@@ -731,9 +731,17 @@ def init_users():
             name {TEXT} PRIMARY KEY,
             pw_hash {TEXT},
             is_admin {TEXT},
-            created_at {TEXT}
+            created_at {TEXT},
+            must_change {TEXT}
         );
         """)
+        # Older installs predate must_change. SQLite has no ADD COLUMN IF NOT
+        # EXISTS, so just try it and accept the failure when it's already there.
+        try:
+            cur.execute(f'ALTER TABLE users ADD COLUMN must_change {TEXT}')
+            conn.commit()
+        except Exception:
+            conn.rollback()
         cur.execute(f"""
         CREATE TABLE IF NOT EXISTS sessions (
             token {TEXT} PRIMARY KEY,
@@ -748,8 +756,16 @@ def init_users():
         conn.close()
 
 
-def create_user(name, password, is_admin=False):
-    """Add or replace a user. Returns the stored name."""
+MIN_PASSWORD_LEN = 8
+
+
+def create_user(name, password, is_admin=False, must_change=True):
+    """Add or replace a user.
+
+    must_change defaults to True: a password someone else typed is a temporary
+    one, and the owner should replace it before doing any work. It is cleared
+    only by set_own_password().
+    """
     name = str(name).strip()
     if not name or not password:
         raise ValueError("name and password are required")
@@ -758,33 +774,62 @@ def create_user(name, password, is_admin=False):
     try:
         cur = conn.cursor()
         row = [name, _hash_password(password), "yes" if is_admin else "no",
-               datetime.now(timezone.utc).isoformat()]
+               datetime.now(timezone.utc).isoformat(), "yes" if must_change else "no"]
         if _IS_PG:
             cur.execute(
-                'INSERT INTO users (name, pw_hash, is_admin, created_at) '
-                'VALUES (%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET '
-                'pw_hash=EXCLUDED.pw_hash, is_admin=EXCLUDED.is_admin', row)
+                'INSERT INTO users (name, pw_hash, is_admin, created_at, must_change) '
+                'VALUES (%s,%s,%s,%s,%s) ON CONFLICT (name) DO UPDATE SET '
+                'pw_hash=EXCLUDED.pw_hash, is_admin=EXCLUDED.is_admin, '
+                'must_change=EXCLUDED.must_change', row)
         else:
             cur.execute('INSERT OR REPLACE INTO users '
-                        '(name, pw_hash, is_admin, created_at) VALUES (?,?,?,?)', row)
+                        '(name, pw_hash, is_admin, created_at, must_change) '
+                        'VALUES (?,?,?,?,?)', row)
         conn.commit()
         return name
     finally:
         conn.close()
 
 
+def set_own_password(name, current_password, new_password):
+    """A user replacing their own password. Requires the current one, so a
+    stolen session token alone can't lock the owner out of their account.
+    Clears must_change and drops every other session for that user."""
+    if not new_password or len(new_password) < MIN_PASSWORD_LEN:
+        raise ValueError(f"New password must be at least {MIN_PASSWORD_LEN} characters.")
+    if new_password == current_password:
+        raise ValueError("New password must be different from the current one.")
+    user = verify_user(name, current_password)
+    if not user:
+        raise PermissionError("Current password is incorrect.")
+    create_user(name, new_password, is_admin=user["is_admin"], must_change=False)
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'DELETE FROM sessions WHERE name = {PLACEHOLDER}', (str(name).strip(),))
+        conn.commit()
+    finally:
+        conn.close()
+    return True
+
+
+def must_change_password(name):
+    row = _user_row(name)
+    return bool(row) and row.get("must_change") == "yes"
+
+
 def _user_row(name):
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(f'SELECT name, pw_hash, is_admin FROM users WHERE name = {PLACEHOLDER}',
-                    (str(name).strip(),))
+        cur.execute(f'SELECT name, pw_hash, is_admin, must_change FROM users '
+                    f'WHERE name = {PLACEHOLDER}', (str(name).strip(),))
         r = cur.fetchone()
         if not r:
             return None
         if isinstance(r, dict):
             return dict(r)
-        return {"name": r[0], "pw_hash": r[1], "is_admin": r[2]}
+        return {"name": r[0], "pw_hash": r[1], "is_admin": r[2], "must_change": r[3]}
     finally:
         conn.close()
 
@@ -795,7 +840,8 @@ def verify_user(name, password):
     row = _user_row(name)
     if not row or not _verify_password(password or "", row.get("pw_hash")):
         return None
-    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes"}
+    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes",
+            "must_change": row.get("must_change") == "yes"}
 
 
 def list_users():
@@ -803,12 +849,13 @@ def list_users():
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute("SELECT name, is_admin, created_at FROM users ORDER BY name")
+        cur.execute("SELECT name, is_admin, created_at, must_change FROM users ORDER BY name")
         out = []
         for r in cur.fetchall():
             d = dict(r) if isinstance(r, dict) else {
-                "name": r[0], "is_admin": r[1], "created_at": r[2]}
+                "name": r[0], "is_admin": r[1], "created_at": r[2], "must_change": r[3]}
             out.append({"name": d["name"], "is_admin": d.get("is_admin") == "yes",
+                        "must_change": d.get("must_change") == "yes",
                         "created_at": d.get("created_at")})
         return out
     finally:
@@ -870,7 +917,8 @@ def session_user(token):
     row = _user_row(d["name"])
     if not row:
         return None
-    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes"}
+    return {"name": row["name"], "is_admin": row.get("is_admin") == "yes",
+            "must_change": row.get("must_change") == "yes"}
 
 
 def delete_session(token):
@@ -972,7 +1020,32 @@ if __name__ == "__main__":
         if not us:
             print("No users yet. Add one:  python hygiene_db.py add-user \"Name\" <password> [admin]")
         for u in us:
-            print(f"  {u['name']}{'  (admin)' if u['is_admin'] else ''}")
+            flags = []
+            if u["is_admin"]:
+                flags.append("admin")
+            if u.get("must_change"):
+                flags.append("must set own password")
+            print(f"  {u['name']}{'  (' + ', '.join(flags) + ')' if flags else ''}")
+    elif cmd == "seed-users":
+        # python hygiene_db.py seed-users "Name A" "Name B:admin" ...
+        # Generates a temporary password for each and prints it ONCE. Every user
+        # must replace it at first login, so these are safe to send over chat.
+        import secrets as _s
+        words = ("amber blue coral delta ember frost grove ivory jade lunar "
+                 "maple noble opal quartz river slate topaz umber vivid willow").split()
+        made = []
+        for spec in args[1:]:
+            nm_, _, flag = spec.partition(":")
+            tmp = f"{_s.choice(words).capitalize()}-{_s.choice(words)}-{_s.randbelow(9000)+1000}"
+            create_user(nm_.strip(), tmp, is_admin=flag.strip().lower() == "admin",
+                        must_change=True)
+            made.append((nm_.strip(), tmp, flag.strip().lower() == "admin"))
+        print(f"\nCreated {len(made)} user(s) in {backend_name()}.")
+        print("Give each person their temporary password. They MUST set their own")
+        print("at first login — these stop working the moment they do.\n")
+        for nm_, tmp, adm in made:
+            print(f"  {nm_}{' (admin)' if adm else ''}\n      temporary password: {tmp}")
+        print()
     elif cmd == "del-user":
         delete_user(args[1])
         print(f"Removed user '{args[1]}' and any active sessions")
