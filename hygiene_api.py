@@ -152,13 +152,24 @@ def validate(payload: ValidatePayload):
     if not payload.asin or not payload.validated_by:
         raise HTTPException(status_code=400,
                             detail="asin and validated_by are required")
+    # Fill the brand from the crawl when the client can't supply it (the app's
+    # offline-catch-up push runs before the product list has loaded). Without
+    # this the row stores brand='' and /progress?brand=... — which matches on
+    # LOWER(brand) LIKE — silently under-counts it.
+    brand = (payload.brand or "").strip()
+    if not brand:
+        asin = payload.asin.strip()
+        match = next((r for r in db.fetch_latest()
+                      if str(r.get("ASIN", "")).strip() == asin), None)
+        if match:
+            brand = str(match.get("Brand", "") or "").strip()
     try:
         db.mark_done(
             asin=payload.asin,
             validated_by=payload.validated_by,
             check_results=payload.check_results or {},
             notes=payload.notes or "",
-            brand=payload.brand or "",
+            brand=brand,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
