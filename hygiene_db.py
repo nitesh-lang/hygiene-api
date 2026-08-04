@@ -1464,10 +1464,15 @@ def _user_row(name):
         conn.close()
 
 
-def _user_row_by_login(login):
-    """Resolve a sign-in identifier. Accepts the email address or the display
-    name, both case-insensitively — people type their name inconsistently and
-    an email is easier to remember than an exact spelling of 'Sagar Sakapl'."""
+def _user_row_by_login(login, email_only=False):
+    """Resolve an identifier to a user row, case-insensitively.
+
+    email_only=True restricts it to the email address, and is what the sign-in
+    route uses: the field is labelled 'Work Email', so accepting 'Naresh more'
+    there makes the form lie about what it wants. Internal callers keep the name
+    fallback — set_own_password() resolves the canonical display name it was
+    handed by the session, which is not an email.
+    """
     login = str(login or "").strip().lower()
     if not login:
         return None
@@ -1484,16 +1489,17 @@ def _user_row_by_login(login):
             "must_change": r[3], "email": r[4]}
         if str(d.get("email") or "").strip().lower() == login:
             return d
-        if str(d.get("name") or "").strip().lower() == login:
+        if not email_only and str(d.get("name") or "").strip().lower() == login:
             return d
     return None
 
 
-def verify_user(login, password):
+def verify_user(login, password, email_only=False):
     """Return {name, email, is_admin, must_change} when the password matches
-    the account identified by `login` (email or name), else None."""
+    the account identified by `login`, else None. See _user_row_by_login for
+    what `login` may be."""
     init_users()
-    row = _user_row_by_login(login)
+    row = _user_row_by_login(login, email_only=email_only)
     if not row or not _verify_password(password or "", row.get("pw_hash")):
         return None
     return {"name": row["name"], "email": row.get("email") or "",

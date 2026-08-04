@@ -195,6 +195,32 @@ ok(not db.must_change_password("Nitesh Sharma"), "others are left alone")
 miss = db.run_monthly_password_reset(period="2027-05", only=["Nobody At All"])
 ok(miss["missing"] == ["Nobody At All"], "an unknown name is reported, not silently skipped")
 
+section("14. signing in is by work email only")
+fresh_team()
+ok(db.verify_user("naresh@cambiumretail.com", "own-naresh-1", email_only=True) is not None,
+   "the work email signs you in")
+ok(db.verify_user("NARESH@Cambiumretail.COM", "own-naresh-1", email_only=True) is not None,
+   "...case-insensitively")
+ok(db.verify_user("Naresh More", "own-naresh-1", email_only=True) is None,
+   "the display name does NOT sign you in")
+ok(db.verify_user("Naresh more", "own-naresh-1", email_only=True) is None,
+   "...in any casing")
+ok(db.verify_user("naresh@cambiumretail.com", "wrong", email_only=True) is None,
+   "a wrong password is still refused")
+
+# The regression this change could easily have caused: the change-password
+# route hands set_own_password the canonical DISPLAY NAME from the session, not
+# an email. Locking the resolver to emails outright would have made every
+# password change fail with "current password is incorrect" — including the
+# forced one on the 2nd, which would wedge the whole team out of the app.
+db.run_monthly_password_reset(period="2027-06")
+db.set_own_password("Naresh More", "own-naresh-1", "brand-new-password")
+ok(db.verify_user("naresh@cambiumretail.com", "brand-new-password",
+                  email_only=True) is not None,
+   "changing a password still works when called with the display name")
+ok(not db.must_change_password("Naresh More"),
+   "...and it clears the monthly flag")
+
 
 # ---------------------------------------------------------------------------
 print(f"\n{passed} passed, {failed} failed")

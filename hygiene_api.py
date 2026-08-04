@@ -148,8 +148,9 @@ def health():
 
 # ── login ────────────────────────────────────────────────────────────────────
 class LoginPayload(BaseModel):
-    # Sign in with the work email; the display name is accepted too so an
-    # account still works before its address has been filled in.
+    # The work email, and only that. The field is called `name` for the client
+    # it already ships with; renaming it would break every browser holding the
+    # current bundle.
     name: str
     password: str
 
@@ -161,15 +162,19 @@ class ChangePasswordPayload(BaseModel):
 
 @app.post("/login")
 def login(payload: LoginPayload):
-    """Exchange name + password for a bearer token. The team's credentials used
-    to sit in plaintext inside the browser bundle; they're hashed in the DB now
-    and the browser only ever holds an opaque token.
+    """Exchange work email + password for a bearer token. The team's credentials
+    used to sit in plaintext inside the browser bundle; they're hashed in the DB
+    now and the browser only ever holds an opaque token.
 
-    must_change=True means the password was issued by someone else and the user
-    has to replace it before working — the client gates the app on this."""
-    user = db.verify_user(payload.name, payload.password)
+    email_only: this route used to accept the display name as well, which made a
+    field labelled 'Work Email' quietly sign people in on 'Naresh more'.
+
+    must_change=True means the user owes us a new password — a first sign-in on
+    an issued one, or the monthly rotation. The client gates the app on it."""
+    user = db.verify_user(payload.name, payload.password, email_only=True)
     if not user:
-        raise HTTPException(status_code=401, detail="Incorrect name or password.")
+        raise HTTPException(status_code=401,
+                            detail="Incorrect work email or password.")
     return {"token": db.create_session(user["name"]),
             "name": user["name"], "email": user.get("email", ""),
             "admin": user["is_admin"],
