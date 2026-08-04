@@ -688,6 +688,366 @@ def get_input_sheet():
 
 
 # --------------------------------------------------------------------------
+# Product specs (OUR OWN dimensions + packed weight)
+# --------------------------------------------------------------------------
+# Why this table exists at all: the validator already had Weight and Dimensions
+# checks, but the "reference" side came from the input sheet — and that sheet's
+# Item Weight (g) / Dimensions columns were themselves filled in FROM Amazon
+# (188 of 214 comparable rows are byte-identical to the crawled PDP). So those
+# checks were comparing Amazon against Amazon and passing by construction.
+#
+# This table is the first genuinely independent record: what WE measured. Amazon
+# bills FBA storage and fulfilment on the greater of actual and volumetric
+# weight, so an Amazon-side re-measure that inflates a box silently raises fees.
+# Comparing the two sides is the only way to catch that.
+#
+# Everything is TEXT for consistency with the rest of the schema, but values are
+# NORMALISED on the way in: centimetres and kilograms, always.
+SPEC_FIELDS = ["asin", "length_cm", "breadth_cm", "height_cm", "weight_kg",
+               "source", "updated_at", "notes"]
+
+# Amazon India divides cm³ by 5000 to get volumetric ("dimensional") weight in kg.
+# Kept as a named constant because it is a policy number, not a fact — if Amazon
+# changes the divisor, or this is ever used for another marketplace, this is the
+# single place to change. The frontend has the same constant in App.jsx.
+VOLUMETRIC_DIVISOR = 5000.0
+
+
+def volumetric_kg(length_cm, breadth_cm, height_cm, divisor=VOLUMETRIC_DIVISOR):
+    """Volumetric weight in kg from centimetres, or None if any side is missing."""
+    try:
+        l, b, h = float(length_cm), float(breadth_cm), float(height_cm)
+    except (TypeError, ValueError):
+        return None
+    if l <= 0 or b <= 0 or h <= 0:
+        return None
+    return round(l * b * h / divisor, 3)
+
+
+def chargeable_kg(actual_kg, volumetric):
+    """What Amazon actually bills on: the GREATER of actual and volumetric."""
+    vals = []
+    for v in (actual_kg, volumetric):
+        try:
+            f = float(v)
+            if f > 0:
+                vals.append(f)
+        except (TypeError, ValueError):
+            pass
+    return round(max(vals), 3) if vals else None
+
+
+def init_product_specs():
+    """Create the product_specs table. Safe to call repeatedly."""
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS product_specs (
+            asin {TEXT} PRIMARY KEY,
+            length_cm {TEXT},
+            breadth_cm {TEXT},
+            height_cm {TEXT},
+            weight_kg {TEXT},
+            source {TEXT},
+            updated_at {TEXT},
+            notes {TEXT}
+        );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_product_specs(rows, source=""):
+    """Upsert our reference specs. rows = list of dicts with the SPEC_FIELDS keys
+    (asin required). Partial rows are allowed — an ASIN whose weight is not known
+    yet still stores its dimensions, and the UI just shows the weight as pending.
+
+    Upserts rather than replaces, so importing a second file that covers more
+    ASINs adds to the set instead of wiping the ASINs it does not mention.
+    """
+    if not rows:
+        return 0
+    init_product_specs()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        n = 0
+        for r in rows:
+            asin = str(r.get("asin", "")).strip().upper()
+            if not asin:
+                continue
+            vals = [asin,
+                    str(r.get("length_cm", "") or ""),
+                    str(r.get("breadth_cm", "") or ""),
+                    str(r.get("height_cm", "") or ""),
+                    str(r.get("weight_kg", "") or ""),
+                    str(r.get("source", "") or source or ""),
+                    now,
+                    str(r.get("notes", "") or "")]
+            quoted = ", ".join(f'"{f}"' for f in SPEC_FIELDS)
+            marks = ", ".join([PLACEHOLDER] * len(SPEC_FIELDS))
+            if _IS_PG:
+                updates = ", ".join(f'"{f}" = EXCLUDED."{f}"'
+                                    for f in SPEC_FIELDS if f != "asin")
+                sql = (f'INSERT INTO product_specs ({quoted}) VALUES ({marks}) '
+                       f'ON CONFLICT (asin) DO UPDATE SET {updates}')
+            else:
+                sql = f'INSERT OR REPLACE INTO product_specs ({quoted}) VALUES ({marks})'
+            cur.execute(sql, vals)
+            n += 1
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
+def get_product_specs(asins=None):
+    """Return our reference specs as a list of dicts. asins=None returns all."""
+    init_product_specs()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT asin, length_cm, breadth_cm, height_cm, weight_kg, "
+                    "source, updated_at, notes FROM product_specs ORDER BY asin")
+        out = []
+        for row in cur.fetchall():
+            d = dict(row) if isinstance(row, dict) else dict(zip(SPEC_FIELDS, row))
+            out.append(d)
+        if asins:
+            want = {str(a).strip().upper() for a in asins}
+            out = [d for d in out if d["asin"] in want]
+        return out
+    finally:
+        conn.close()
+
+
+def delete_product_spec(asin):
+    init_product_specs()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'DELETE FROM product_specs WHERE asin = {PLACEHOLDER}',
+                    (str(asin).strip().upper(),))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+# ── spec-sheet importer ──────────────────────────────────────────────────────
+# Deliberately tolerant about column NAMING and UNITS, because the whole point is
+# that when a corrected sheet arrives the only thing that changes is the file —
+# not this code. It finds the ASIN column, then the first L / B / H / weight
+# columns after it, reads the unit out of the header ("L(cm)", "Weight Kg",
+# "Height (mm)"), and normalises to cm/kg.
+_LEN_UNITS = [(("mm", "millimet"), 0.1), (("cm", "centimet"), 1.0),
+              (("inch", '"', " in"), 2.54), (("meter", "metre"), 100.0)]
+_WT_UNITS = [(("kg", "kilogram"), 1.0), (("gram", " g", "(g)", "gm"), 0.001)]
+
+
+def _hdr_unit(header, table, default):
+    """Pull a unit multiplier out of a column header. 'L(cm)' -> 1.0."""
+    h = f" {str(header).lower().strip()} "
+    for keys, mult in table:
+        if any(k in h for k in keys):
+            return mult
+    return default
+
+
+def _spec_num(value, mult):
+    """A cell -> a normalised float, or None. Tolerates '36 cm', '36.0', 36."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("nan", "none", "-", "na", "n/a"):
+        return None
+    import re
+    m = re.search(r"\d+(?:\.\d+)?", s.replace(",", ""))
+    if not m:
+        return None
+    # A unit written in the CELL beats the one in the header ("4 kg" in a g column).
+    low = s.lower()
+    if mult in (1.0, 0.001):        # weight column
+        if "kg" in low or "kilo" in low:
+            mult = 1.0
+        elif "gram" in low or re.search(r"\d\s*g\b", low):
+            mult = 0.001
+    else:                            # length column
+        if "mm" in low:
+            mult = 0.1
+        elif "cm" in low:
+            mult = 1.0
+        elif "inch" in low or '"' in low:
+            mult = 2.54
+    return round(float(m.group(0)) * mult, 3)
+
+
+def _find_spec_columns(headers):
+    """Map headers -> {asin, l, b, h, w} column indexes, plus every candidate
+    found. Takes the FIRST match after the ASIN column for each of L/B/H/W: a
+    sheet that carries both our numbers and Amazon's (as the 2026-08 one does)
+    lists ours first, and guessing from labels like 'Actual' is unreliable —
+    it is genuinely ambiguous which side that word describes. The extras are
+    returned so the caller can print them and the operator can override."""
+    import re
+    low = [str(h or "").strip().lower() for h in headers]
+
+    def matches(i, *pats):
+        h = low[i]
+        return any(re.search(p, h) for p in pats)
+
+    asin_i = next((i for i in range(len(low)) if low[i] == "asin"), None)
+    if asin_i is None:
+        asin_i = next((i for i in range(len(low)) if "asin" in low[i]), None)
+    if asin_i is None:
+        raise ValueError("No ASIN column found. Expected a column headed 'ASIN'.")
+
+    cand = {"l": [], "b": [], "h": [], "w": []}
+    for i in range(len(low)):
+        if i == asin_i or not low[i]:
+            continue
+        # weight first — "Weight Kg" must not be read as a length
+        if matches(i, r"weight", r"^wt\b", r"^wt[\s(]"):
+            cand["w"].append(i)
+        elif matches(i, r"^l\b", r"^l[\s(]", r"length"):
+            cand["l"].append(i)
+        elif matches(i, r"^b\b", r"^b[\s(]", r"breadth", r"^w\b", r"^w[\s(]", r"width"):
+            cand["b"].append(i)
+        elif matches(i, r"^h\b", r"^h[\s(]", r"height"):
+            cand["h"].append(i)
+
+    after = lambda lst: next((i for i in lst if i > asin_i), (lst[0] if lst else None))
+    return {"asin": asin_i, "l": after(cand["l"]), "b": after(cand["b"]),
+            "h": after(cand["h"]), "w": after(cand["w"])}, cand
+
+
+def parse_spec_sheet(path, sheet=0, overrides=None):
+    """Read a dimensions/weight workbook into normalised spec dicts.
+
+    Returns (rows, report). `report` describes what was matched so the operator
+    can see which columns were used and catch a mis-detected sheet immediately
+    instead of after the numbers are already in the database.
+    """
+    import pandas as pd
+    raw = pd.read_excel(path, sheet_name=sheet, header=None, dtype=object)
+    raw = raw.where(pd.notnull(raw), None)
+    grid = raw.values.tolist()
+    if not grid:
+        raise ValueError("Sheet is empty.")
+
+    # Header row = the first row in the top 8 that mentions an ASIN column.
+    hdr_i = None
+    for i, row in enumerate(grid[:8]):
+        if any("asin" in str(c or "").strip().lower() for c in row):
+            hdr_i = i
+            break
+    if hdr_i is None:
+        raise ValueError("No header row with an 'ASIN' column in the first 8 rows.")
+    headers = [str(c).strip() if c is not None else "" for c in grid[hdr_i]]
+
+    idx, cand = _find_spec_columns(headers)
+    if overrides:
+        idx.update({k: v for k, v in overrides.items() if v is not None})
+    missing = [k for k in ("l", "b", "h") if idx.get(k) is None]
+
+    lm = {k: _hdr_unit(headers[idx[k]], _LEN_UNITS, 1.0)
+          for k in ("l", "b", "h") if idx.get(k) is not None}
+    wm = _hdr_unit(headers[idx["w"]], _WT_UNITS, 1.0) if idx.get("w") is not None else None
+
+    rows, skipped = [], 0
+    for r in grid[hdr_i + 1:]:
+        if idx["asin"] >= len(r):
+            continue
+        asin = str(r[idx["asin"]] or "").strip().upper()
+        if len(asin) < 5:
+            continue
+        get = lambda k, mult: (_spec_num(r[idx[k]], mult)
+                               if idx.get(k) is not None and idx[k] < len(r) else None)
+        L = get("l", lm.get("l", 1.0))
+        B = get("b", lm.get("b", 1.0))
+        H = get("h", lm.get("h", 1.0))
+        W = get("w", wm) if wm is not None else None
+        if L is None and B is None and H is None and W is None:
+            skipped += 1          # a row Sagar has not filled in yet
+            continue
+        rows.append({"asin": asin,
+                     "length_cm": "" if L is None else L,
+                     "breadth_cm": "" if B is None else B,
+                     "height_cm": "" if H is None else H,
+                     "weight_kg": "" if W is None else W,
+                     "source": os.path.basename(str(path))})
+
+    used = {k: (headers[idx[k]] if idx.get(k) is not None else None)
+            for k in ("asin", "l", "b", "h", "w")}
+    extras = {k: [headers[i] for i in v[1:]] for k, v in cand.items() if len(v) > 1}
+    return rows, {"header_row": hdr_i + 1, "columns_used": used,
+                  "other_candidates": extras, "rows": len(rows),
+                  "blank_rows_skipped": skipped, "missing": missing}
+
+
+def import_spec_sheet(path, sheet=0, overrides=None):
+    rows, report = parse_spec_sheet(path, sheet=sheet, overrides=overrides)
+    n = save_product_specs(rows, source=os.path.basename(str(path)))
+    report["imported"] = n
+    return report
+
+
+# --------------------------------------------------------------------------
+# Amazon-side changes (from the append-only crawl history)
+# --------------------------------------------------------------------------
+def spec_changes(fields=("dimensions", "weight"), brand=None):
+    """Per ASIN, the previous vs current crawled value for each field and when it
+    moved — this is the "what did Amazon change" half of the fee-risk question.
+
+    Reads `products`, which is append-only across crawl runs, so it needs at
+    least two runs covering an ASIN to report anything. With a single run it
+    correctly returns nothing rather than inventing a baseline.
+    """
+    init_db()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cols = ", ".join(f'"{f}"' for f in fields)
+        sql = (f'SELECT asin, brand, crawl_run, crawled_at, {cols} '
+               f'FROM products ORDER BY asin, crawled_at')
+        cur.execute(sql)
+        by_asin = {}
+        for row in cur.fetchall():
+            d = dict(row) if isinstance(row, dict) else dict(
+                zip(["asin", "brand", "crawl_run", "crawled_at"] + list(fields), row))
+            by_asin.setdefault(str(d.get("asin") or "").strip().upper(), []).append(d)
+    finally:
+        conn.close()
+
+    out = {}
+    for asin, hist in by_asin.items():
+        if not asin or len(hist) < 2:
+            continue
+        if brand and brand.lower() not in str(hist[-1].get("brand") or "").lower():
+            continue
+        changes = {}
+        for f in fields:
+            # Walk back from the newest to the most recent DIFFERENT value, so a
+            # change is still reported after several unchanged crawls have run
+            # on top of it.
+            cur_v = str(hist[-1].get(f) or "").strip()
+            prev = next((h for h in reversed(hist[:-1])
+                         if str(h.get(f) or "").strip() != cur_v), None)
+            if prev is None:
+                continue
+            changes[f] = {"from": str(prev.get(f) or "").strip(),
+                          "to": cur_v,
+                          "changed_after": prev.get("crawled_at"),
+                          "seen_at": hist[-1].get("crawled_at")}
+        if changes:
+            out[asin] = changes
+    return out
+
+
+# --------------------------------------------------------------------------
 # Users & sessions
 # --------------------------------------------------------------------------
 # The validator's login used to be a plaintext table inside the React bundle,
@@ -753,12 +1113,41 @@ def init_users():
         );
         """)
         cur.execute('CREATE INDEX IF NOT EXISTS idx_sess_name ON sessions (name);')
+        # Previous password hashes, so the monthly rotation can't be dodged by
+        # flipping between the same two passwords. Only hashes are kept — a row
+        # here can no more reveal a password than the users table can.
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS password_history (
+            id {SERIAL},
+            name {TEXT},
+            pw_hash {TEXT},
+            retired_at {TEXT}
+        );
+        """)
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_pwhist_name ON password_history (name);')
+        # One row per (job, period) so a scheduled job that fires twice in the
+        # same month — a missed run catching up, a manual run, a retry — does
+        # its work exactly once.
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS job_runs (
+            job {TEXT},
+            period {TEXT},
+            ran_at {TEXT},
+            detail {TEXT},
+            PRIMARY KEY (job, period)
+        );
+        """)
         conn.commit()
     finally:
         conn.close()
 
 
 MIN_PASSWORD_LEN = 8
+
+# How many old passwords a user may not go back to. Six covers half a year of
+# monthly rotations, which is long enough that reusing one is a real decision
+# rather than muscle memory.
+PASSWORD_HISTORY_DEPTH = 6
 
 
 def create_user(name, password, is_admin=False, must_change=True, email=None):
@@ -815,6 +1204,62 @@ def set_email(name, email):
         conn.close()
 
 
+def _password_history(name):
+    """The stored hashes of this user's previous passwords, newest first."""
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT pw_hash FROM password_history WHERE name = {PLACEHOLDER} '
+                    f'ORDER BY retired_at DESC', (str(name).strip(),))
+        return [(dict(r)["pw_hash"] if isinstance(r, dict) else r[0])
+                for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def remember_password(name, pw_hash):
+    """File a hash in the history and drop anything past the depth limit, so
+    the table stays a fixed handful of rows per person instead of growing
+    forever. Duplicates are skipped — re-arming twice in a month must not push
+    a genuinely old password out of the window."""
+    if not pw_hash:
+        return
+    init_users()
+    name = str(name).strip()
+    if pw_hash in _password_history(name):
+        return
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f'INSERT INTO password_history (name, pw_hash, retired_at) '
+            f'VALUES ({PLACEHOLDER},{PLACEHOLDER},{PLACEHOLDER})',
+            (name, pw_hash, datetime.now(timezone.utc).isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+    keep = _password_history(name)[:PASSWORD_HISTORY_DEPTH]
+    if not keep:
+        return
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        marks = ",".join([PLACEHOLDER] * len(keep))
+        cur.execute(f'DELETE FROM password_history WHERE name = {PLACEHOLDER} '
+                    f'AND pw_hash NOT IN ({marks})', tuple([name] + keep))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_reused_password(name, new_password):
+    """True when the candidate matches one of the recent hashes. Each stored
+    hash carries its own salt, so this is a verify per entry rather than a
+    lookup — at most PASSWORD_HISTORY_DEPTH of them, on password change only."""
+    return any(_verify_password(new_password, h) for h in _password_history(name))
+
+
 def set_own_password(name, current_password, new_password):
     """A user replacing their own password. Requires the current one, so a
     stolen session token alone can't lock the owner out of their account.
@@ -828,8 +1273,18 @@ def set_own_password(name, current_password, new_password):
         raise PermissionError("Current password is incorrect.")
     # Resolve to the canonical name — `name` may have arrived as an email.
     name = user["name"]
+    if _is_reused_password(name, new_password):
+        raise ValueError(
+            f"You have used this password before. Pick one you have not used in "
+            f"your last {PASSWORD_HISTORY_DEPTH} passwords.")
+    # Retire the outgoing password before overwriting it, otherwise the hash is
+    # gone and next month it counts as new again.
+    old = _user_row(name)
+    if old:
+        remember_password(name, old.get("pw_hash"))
     create_user(name, new_password, is_admin=user["is_admin"], must_change=False,
                 email=user.get("email") or None)
+    remember_password(name, _user_row(name).get("pw_hash"))
     conn = _connect()
     try:
         cur = conn.cursor()
@@ -843,6 +1298,153 @@ def set_own_password(name, current_password, new_password):
 def must_change_password(name):
     row = _user_row(name)
     return bool(row) and row.get("must_change") == "yes"
+
+
+# --------------------------------------------------------------------------
+# Monthly password rotation
+# --------------------------------------------------------------------------
+# On the 2nd of every month the team has to choose a new password. This does
+# NOT set passwords for them and never has: it raises the must_change flag that
+# already gates the app, so each person signs in with the password they know and
+# picks their own replacement. Nobody — including whoever runs the job — ever
+# sees or types someone else's password.
+#
+# Deliberately narrow. It writes to `users.must_change`, `password_history` and
+# `job_runs`, and to nothing else. Products, validations, validation history and
+# the input sheet are never opened, and live sessions are left alone: /me
+# reports must_change, so the app raises the change-password screen on the next
+# page load without signing anyone out of work they haven't synced yet.
+MONTHLY_RESET_JOB = "monthly-password-reset"
+
+
+def current_period(when=None):
+    """The 'YYYY-MM' bucket a run belongs to, from LOCAL time — the schedule
+    that triggers it is local, so the label should agree with the calendar on
+    the wall rather than with UTC."""
+    when = when or datetime.now()
+    return f"{when.year:04d}-{when.month:02d}"
+
+
+def get_job_run(job, period):
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f'SELECT job, period, ran_at, detail FROM job_runs '
+                    f'WHERE job = {PLACEHOLDER} AND period = {PLACEHOLDER}',
+                    (job, period))
+        r = cur.fetchone()
+        if not r:
+            return None
+        return dict(r) if isinstance(r, dict) else {
+            "job": r[0], "period": r[1], "ran_at": r[2], "detail": r[3]}
+    finally:
+        conn.close()
+
+
+def record_job_run(job, period, detail=""):
+    init_users()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        row = (job, period, datetime.now(timezone.utc).isoformat(), str(detail))
+        if _IS_PG:
+            cur.execute('INSERT INTO job_runs (job, period, ran_at, detail) '
+                        'VALUES (%s,%s,%s,%s) ON CONFLICT (job, period) DO UPDATE '
+                        'SET ran_at=EXCLUDED.ran_at, detail=EXCLUDED.detail', row)
+        else:
+            cur.execute('INSERT OR REPLACE INTO job_runs (job, period, ran_at, detail) '
+                        'VALUES (?,?,?,?)', row)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _arm_user(name):
+    """Raise must_change for one user WITHOUT touching their password hash."""
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"UPDATE users SET must_change = 'yes' WHERE name = {PLACEHOLDER}",
+                    (str(name).strip(),))
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def run_monthly_password_reset(period=None, only=None, force=False, dry_run=False):
+    """Require every user to choose a new password this month.
+
+    Returns a summary dict; never raises for an ordinary condition, so a
+    scheduled run either reports what it did or reports why it did nothing.
+
+    force=False makes this idempotent per month. A scheduler catching up on a
+    missed run, a retry, or someone running it by hand on the 5th must not
+    re-arm people who have already chosen their new password.
+    """
+    init_users()
+    period = period or current_period()
+    prev = get_job_run(MONTHLY_RESET_JOB, period)
+    if prev and not force:
+        return {"period": period, "already_ran": True, "ran_at": prev.get("ran_at"),
+                "detail": prev.get("detail", ""), "armed": [], "already_pending": [],
+                "missing": [], "dry_run": dry_run}
+
+    roster = list_users()
+    if only:
+        wanted = {str(n).strip().lower() for n in only}
+        missing = [n for n in only
+                   if str(n).strip().lower() not in
+                   {u["name"].strip().lower() for u in roster}
+                   and str(n).strip().lower() not in
+                   {(u.get("email") or "").strip().lower() for u in roster}]
+        roster = [u for u in roster
+                  if u["name"].strip().lower() in wanted
+                  or (u.get("email") or "").strip().lower() in wanted]
+    else:
+        missing = []
+
+    armed, already = [], []
+    for u in roster:
+        if u.get("must_change"):
+            # Still owes us a password from last time — leave the flag alone
+            # rather than reporting it as freshly armed.
+            already.append(u["name"])
+            continue
+        if not dry_run:
+            row = _user_row(u["name"])
+            if row:
+                # Keep the outgoing hash so this month's choice can't be one of
+                # the last few. Their password does not change here.
+                remember_password(u["name"], row.get("pw_hash"))
+            _arm_user(u["name"])
+        armed.append(u["name"])
+
+    detail = (f"armed={len(armed)} already_pending={len(already)} "
+              f"total={len(roster)}")
+    if not dry_run:
+        record_job_run(MONTHLY_RESET_JOB, period, detail)
+    return {"period": period, "already_ran": False, "armed": armed,
+            "already_pending": already, "missing": missing, "detail": detail,
+            "dry_run": dry_run,
+            "ran_at": datetime.now(timezone.utc).isoformat()}
+
+
+def password_reset_status(period=None):
+    """What the current month looks like: whether the job has run and who has
+    yet to choose a new password."""
+    init_users()
+    period = period or current_period()
+    run = get_job_run(MONTHLY_RESET_JOB, period)
+    roster = list_users()
+    return {"period": period,
+            "ran": bool(run),
+            "ran_at": (run or {}).get("ran_at"),
+            "detail": (run or {}).get("detail", ""),
+            "pending": [u["name"] for u in roster if u.get("must_change")],
+            "done": [u["name"] for u in roster if not u.get("must_change")],
+            "total": len(roster)}
 
 
 def _user_row(name):
@@ -1015,6 +1617,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
         print("Commands: init | import-csv <path> | import-input <path.xlsx> [sheet] | show-input | show <asin> | run <crawl_run> | stats")
+        print("  specs:  import-specs <path.xlsx> [sheet] [--l=C --b=D --h=E --w=F]")
+        print("          list-specs | spec-changes [brand] | spec-template <brand> [out.xlsx]")
         print("Backend:", backend_name())
         sys.exit(0)
 
@@ -1056,6 +1660,105 @@ if __name__ == "__main__":
         n = save_input_sheet(cols, rows,
                              sheet_name=(sheet if isinstance(sheet, str) else "Format"))
         print(f"Imported input sheet: {n} rows, {len(cols)} cols into {backend_name()}")
+    elif cmd == "import-specs":
+        # python hygiene_db.py import-specs "Dimension - Weight.xlsx" [sheet] [--l=C --b=D --h=E --w=F]
+        # Our OWN measured dimensions + packed weight. Column names and units are
+        # auto-detected, so a re-issued sheet needs no code change — but what was
+        # detected is printed every time, because silently importing the wrong
+        # block of a two-block sheet would invert every discrepancy flag.
+        path = args[1]
+        flags = {a.split("=")[0][2:]: a.split("=", 1)[1]
+                 for a in args[2:] if a.startswith("--") and "=" in a}
+        positional = [a for a in args[2:] if not a.startswith("--")]
+        sheet = positional[0] if positional else 0
+
+        def _col(letter):
+            """'C' or '2' -> a 0-based column index."""
+            s = str(letter).strip()
+            if s.isdigit():
+                return int(s)
+            n = 0
+            for ch in s.upper():
+                n = n * 26 + (ord(ch) - 64)
+            return n - 1
+
+        overrides = {k: _col(v) for k, v in flags.items()
+                     if k in ("asin", "l", "b", "h", "w")}
+        rep = import_spec_sheet(path, sheet=sheet, overrides=overrides or None)
+        print(f"Imported {rep['imported']} spec rows into {backend_name()}")
+        print(f"  header row      : {rep['header_row']}")
+        for k, v in rep["columns_used"].items():
+            print(f"  {k:<15} -> {v if v is not None else 'NOT FOUND'}")
+        if rep["blank_rows_skipped"]:
+            print(f"  blank rows skipped: {rep['blank_rows_skipped']} "
+                  f"(ASINs not measured yet)")
+        if rep["missing"]:
+            print(f"  WARNING: no column found for {', '.join(rep['missing']).upper()}"
+                  f" — volumetric weight cannot be computed for these rows.")
+        if rep["other_candidates"]:
+            print("  NOTE: this sheet has more than one set of dimension columns.")
+            print("        The FIRST set after ASIN was used (that is our own data in")
+            print("        the 2026-08 sheet; the second set is Amazon's). Ignored:")
+            for k, v in rep["other_candidates"].items():
+                print(f"          {k.upper()}: {', '.join(v)}")
+            print("        Override with e.g. --l=I --b=J --h=K --w=L if that is wrong.")
+    elif cmd == "list-specs":
+        rows = get_product_specs()
+        if not rows:
+            print("No product specs imported yet.  "
+                  "python hygiene_db.py import-specs <file.xlsx>")
+        for r in rows:
+            dims = " x ".join(str(r[k] or "?") for k in
+                              ("length_cm", "breadth_cm", "height_cm"))
+            vol = volumetric_kg(r["length_cm"], r["breadth_cm"], r["height_cm"])
+            print(f"  {r['asin']:<12} {dims:<22} cm   "
+                  f"{str(r['weight_kg'] or '?'):>6} kg   "
+                  f"vol {vol if vol is not None else '?'} kg")
+        print(f"\n{len(rows)} ASINs with our own measurements.")
+    elif cmd == "spec-changes":
+        brand = args[1] if len(args) > 1 else None
+        ch = spec_changes(brand=brand)
+        if not ch:
+            print("No Amazon-side dimension/weight changes found.")
+            print("This needs at least TWO crawl runs covering the same ASIN — "
+                  "run the crawler again and it will start reporting.")
+        for asin, fields in sorted(ch.items()):
+            print(f"  {asin}")
+            for f, c in fields.items():
+                print(f"     {f}: {c['from']!r} -> {c['to']!r}  (after {c['changed_after']})")
+    elif cmd == "spec-template":
+        # python hygiene_db.py spec-template Nexlev "Nexlev dimensions template.xlsx"
+        # A one-block sheet for the team to fill in, pre-listed with every ASIN of
+        # a brand and pre-filled with anything already imported. One block only,
+        # so there is no ambiguity about which numbers are ours.
+        import pandas as pd
+        brand = args[1] if len(args) > 1 else "Nexlev"
+        out = args[2] if len(args) > 2 else f"{brand} dimensions template.xlsx"
+        have = {r["asin"]: r for r in get_product_specs()}
+        prods = fetch_latest(brand=brand)
+        recs = []
+        for p in sorted(prods, key=lambda x: str(x.get("SKU") or "")):
+            a = str(p.get("ASIN") or "").strip().upper()
+            if not a:
+                continue
+            h = have.get(a, {})
+            recs.append({
+                "ASIN": a,
+                "SKU": p.get("SKU", ""),
+                "Title": str(p.get("Title", ""))[:80],
+                "Length (cm)": h.get("length_cm", ""),
+                "Breadth (cm)": h.get("breadth_cm", ""),
+                "Height (cm)": h.get("height_cm", ""),
+                "Packed Weight (kg)": h.get("weight_kg", ""),
+                "Remarks": h.get("notes", ""),
+            })
+        pd.DataFrame(recs).to_excel(out, index=False, sheet_name="Our Specs")
+        filled = sum(1 for r in recs if r["Length (cm)"] != "")
+        print(f"Wrote {out}")
+        print(f"  {len(recs)} {brand} ASINs · {filled} already filled in · "
+              f"{len(recs) - filled} to measure")
+        print("  Fill ONLY our own measured values — packed/shipping box, not the")
+        print("  bare product. Amazon's side is read from the crawl automatically.")
     elif cmd == "clear-validations":
         clear_validations()
         print(f"Cleared ALL validations into {backend_name()} — everyone starts at 0.")
@@ -1103,6 +1806,50 @@ if __name__ == "__main__":
             create_user(n, pw, is_admin=row.get("is_admin") == "yes",
                         must_change=True)
             print(f"  {n} -> shared password, must set own at next login")
+    elif cmd == "monthly-password-reset":
+        # python hygiene_db.py monthly-password-reset [--dry-run] [--force]
+        #                                             [--period YYYY-MM] ["Name" ...]
+        # Requires everyone to choose a NEW password of their own. No password
+        # is set for them, no session is dropped, and no validation data is
+        # touched. Normally driven by the scheduled task, not typed by hand.
+        flags = [a for a in args[1:] if a.startswith("--")]
+        rest = [a for a in args[1:] if not a.startswith("--")]
+        period = None
+        if "--period" in args:
+            i = args.index("--period")
+            if i + 1 < len(args):
+                period = args[i + 1]
+                rest = [a for a in rest if a != period]
+        res = run_monthly_password_reset(
+            period=period, only=rest or None,
+            force="--force" in flags, dry_run="--dry-run" in flags)
+        if res["already_ran"]:
+            print(f"Already ran for {res['period']} at {res['ran_at']} ({res['detail']}).")
+            print("Nothing changed. Use --force only if you truly want to re-arm.")
+        else:
+            what = "WOULD require" if res["dry_run"] else "Now requires"
+            print(f"{what} a new password from {len(res['armed'])} user(s) "
+                  f"for {res['period']} in {backend_name()}:")
+            for n in res["armed"]:
+                print(f"  {n}")
+            if res["already_pending"]:
+                print(f"Still owed from before ({len(res['already_pending'])}), left as-is:")
+                for n in res["already_pending"]:
+                    print(f"  {n}")
+            for n in res["missing"]:
+                print(f"  no such user: {n}")
+            if res["dry_run"]:
+                print("Dry run — nothing was written.")
+    elif cmd == "password-reset-status":
+        # python hygiene_db.py password-reset-status [YYYY-MM]
+        st = password_reset_status(args[1] if len(args) > 1 else None)
+        print(f"{st['period']} in {backend_name()}: "
+              f"{'ran ' + str(st['ran_at']) if st['ran'] else 'NOT RUN YET'}")
+        if st["detail"]:
+            print(f"  {st['detail']}")
+        print(f"  still to choose a new password ({len(st['pending'])}/{st['total']}):")
+        for n in st["pending"] or ["  (nobody)"]:
+            print(f"    {n}")
     elif cmd == "seed-users":
         # python hygiene_db.py seed-users "Name A" "Name B:admin" ...
         # Generates a temporary password for each and prints it ONCE. Every user

@@ -28,6 +28,8 @@ Endpoints (all JSON):
     POST /validate                    -> save a "Mark Done"
          body: { asin, validated_by, check_results, notes, brand }
     GET  /validation/{asin}           -> the saved validation record (or null)
+    GET  /specs                       -> our own dims/weight + volumetric per ASIN
+    GET  /spec-changes?brand=         -> Amazon-side dims/weight changes over time
 """
 
 import os
@@ -112,6 +114,7 @@ def _startup():
         db.init_validations()
         db.init_input_sheet()
         db.init_users()
+        db.init_product_specs()
     except Exception as e:
         # don't crash the service; /health will report the backend
         print("startup init warning:", e)
@@ -289,6 +292,33 @@ def input_sheet():
     """The current validator input/reference sheet (loaded from backend so users
     don't upload the xlsx). Returns {sheet_name, columns, rows} or null."""
     return db.get_input_sheet()
+
+
+@app.get("/specs")
+def specs():
+    """OUR OWN measured dimensions (cm) and packed weight (kg), per ASIN.
+
+    Separate from /input on purpose. The input sheet's weight and dimension
+    columns were filled in from Amazon's own PDP, so they cannot be used to
+    check Amazon against — this is the independent record. Returns [] until a
+    sheet has been imported with `python hygiene_db.py import-specs <file>`,
+    and the UI simply shows nothing rather than failing.
+    """
+    rows = db.get_product_specs()
+    for r in rows:
+        vol = db.volumetric_kg(r.get("length_cm"), r.get("breadth_cm"),
+                               r.get("height_cm"))
+        r["volumetric_kg"] = vol
+        r["chargeable_kg"] = db.chargeable_kg(r.get("weight_kg"), vol)
+    return rows
+
+
+@app.get("/spec-changes")
+def spec_changes(brand: Optional[str] = None):
+    """What Amazon changed on its side: previous vs current crawled Dimensions
+    and Weight per ASIN, with the crawl timestamps. Empty until a second crawl
+    run exists — the history it reads from is built one crawl at a time."""
+    return db.spec_changes(brand=brand)
 
 
 @app.get("/validations")
