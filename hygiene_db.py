@@ -429,11 +429,71 @@ def init_validations():
         conn.close()
 
 
+def split_check_results(check_results):
+    """Separate a check_results payload into {checkId: decision} and the
+    per-check comment texts the validator typed.
+
+    Comments ride inside check_results under the reserved "comments" key — the
+    same shape the 2026-07-31 ledger replay wrote — so nothing about the table
+    changes and old rows stay readable.
+    """
+    cr = check_results if isinstance(check_results, dict) else {}
+    raw = cr.get("comments")
+    comments = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            comments[str(k)] = "" if v is None else str(v)
+    decisions = {k: v for k, v in cr.items() if k != "comments"}
+    return decisions, comments
+
+
+def merge_comments(existing, incoming):
+    """Fold a save's comments into what is already stored.
+
+    An ASIN gets re-saved by whoever opens it next, and most browsers hold no
+    comment text at all (comments used to live only in the browser that typed
+    them). So a save NEVER deletes by omission: a key that is absent from the
+    incoming payload keeps its stored text, and only an explicit empty string —
+    which is what clearing the box in the UI sends — removes one.
+    """
+    out = dict(existing or {})
+    for k, v in (incoming or {}).items():
+        if str(v).strip():
+            out[k] = v
+        else:
+            out.pop(k, None)
+    return {k: v for k, v in out.items() if str(v).strip()}
+
+
+def stored_comments(asin):
+    """The comment texts currently stored for an ASIN ({} when there are none)."""
+    init_validations()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT check_results FROM validations WHERE asin = {PLACEHOLDER}",
+            (str(asin).strip(),))
+        row = cur.fetchone()
+        if not row:
+            return {}
+        raw = row["check_results"] if isinstance(row, dict) else row[0]
+        try:
+            _, comments = split_check_results(json.loads(raw or "{}"))
+        except Exception:
+            return {}
+        return comments
+    finally:
+        conn.close()
+
+
 def mark_done(asin, validated_by, check_results=None, notes="", brand=""):
     """Record that `validated_by` has finished validating `asin`.
 
-    check_results: dict/list of every check + its Yes/No/NotSure decision
-                   (stored as JSON so the full record is kept for later review).
+    check_results: dict of every check + its Yes/No/NotSure decision, plus an
+                   optional "comments" sub-dict of the text typed against each
+                   check (stored as JSON so the full record is kept for later
+                   review). Stored comments are merged, never dropped.
     Writes BOTH the latest-state row (validations) and an append-only log entry
     (validations_history). After this, the ASIN counts as done for everyone.
     """
@@ -442,7 +502,15 @@ def mark_done(asin, validated_by, check_results=None, notes="", brand=""):
     init_validations()
     asin = str(asin).strip()
     now = datetime.now(timezone.utc).isoformat()
-    cr_json = json.dumps(check_results or {}, ensure_ascii=False)
+    # Comments are merged, not replaced, so one save from a browser that never
+    # saw them cannot wipe what somebody else typed. They then survive every
+    # cleared cache, deleted profile and new device — which is the whole point.
+    decisions, incoming = split_check_results(check_results)
+    comments = merge_comments(stored_comments(asin), incoming)
+    record = dict(decisions)
+    if comments:
+        record["comments"] = comments
+    cr_json = json.dumps(record, ensure_ascii=False)
 
     conn = _connect()
     try:
