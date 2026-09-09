@@ -465,6 +465,22 @@ def merge_comments(existing, incoming):
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
+def stored_notes(asin):
+    """The note currently stored against an ASIN ("" when there is none)."""
+    init_validations()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT notes FROM validations WHERE asin = {PLACEHOLDER}",
+                    (str(asin).strip(),))
+        row = cur.fetchone()
+        if not row:
+            return ""
+        return (row["notes"] if isinstance(row, dict) else row[0]) or ""
+    finally:
+        conn.close()
+
+
 def stored_comments(asin):
     """The comment texts currently stored for an ASIN ({} when there are none)."""
     init_validations()
@@ -487,7 +503,170 @@ def stored_comments(asin):
         conn.close()
 
 
-def mark_done(asin, validated_by, check_results=None, notes="", brand=""):
+# ═══════════════════════════════════════════════════════════════════════════
+# CORRECTIONS — the validator's corrected values
+# ═══════════════════════════════════════════════════════════════════════════
+# These drive the re-decide logic and the Corrected_ columns in the export, and
+# they lived ONLY in the browser until 2026-09-09: a cleared profile took the
+# whole corrections DB with it. Stored one row per correction, keyed by a
+# synthetic string so SQLite and Postgres take the same upsert.
+
+def init_corrections():
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS corrections (
+            key {TEXT} PRIMARY KEY,
+            scope {TEXT},
+            asin {TEXT},
+            check_id {TEXT},
+            value {TEXT},
+            updated_by {TEXT},
+            updated_at {TEXT}
+        );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _corr_key(scope, asin, check_id):
+    return f"{scope}|{asin or ''}|{check_id}"
+
+
+def save_corrections(corrections, updated_by=""):
+    """Upsert a {"global": {...}, "byAsin": {asin: {...}}} payload.
+
+    A value of "" deletes that correction, mirroring how clearing the box in
+    the UI works. Anything not mentioned is left alone, so a browser holding a
+    partial set can never wipe the rest.
+    """
+    init_corrections()
+    corrections = corrections or {}
+    now = datetime.now(timezone.utc).isoformat()
+    pairs = []
+    for cid, val in (corrections.get("global") or {}).items():
+        pairs.append(("global", "", str(cid), val))
+    for asin, checks in (corrections.get("byAsin") or {}).items():
+        for cid, val in (checks or {}).items():
+            pairs.append(("asin", str(asin).strip(), str(cid), val))
+
+    written = deleted = 0
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        for scope, asin, cid, val in pairs:
+            key = _corr_key(scope, asin, cid)
+            if val is None or str(val).strip() == "":
+                cur.execute(f"DELETE FROM corrections WHERE key = {PLACEHOLDER}", (key,))
+                deleted += 1
+                continue
+            fields = ["key", "scope", "asin", "check_id", "value",
+                      "updated_by", "updated_at"]
+            vals = [key, scope, asin, cid, str(val), updated_by or "", now]
+            quoted = ", ".join(f'"{f}"' for f in fields)
+            marks = ", ".join([PLACEHOLDER] * len(fields))
+            if _IS_PG:
+                updates = ", ".join(f'"{f}" = EXCLUDED."{f}"'
+                                    for f in fields if f != "key")
+                sql = (f'INSERT INTO corrections ({quoted}) VALUES ({marks}) '
+                       f'ON CONFLICT (key) DO UPDATE SET {updates}')
+            else:
+                sql = f'INSERT OR REPLACE INTO corrections ({quoted}) VALUES ({marks})'
+            cur.execute(sql, vals)
+            written += 1
+        conn.commit()
+        return {"written": written, "deleted": deleted}
+    finally:
+        conn.close()
+
+
+def list_corrections():
+    """Every stored correction, in the shape the app keeps in state."""
+    init_corrections()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT scope, asin, check_id, value FROM corrections")
+        out = {"global": {}, "byAsin": {}}
+        for r in cur.fetchall():
+            if isinstance(r, dict):
+                scope, asin, cid, val = (r["scope"], r["asin"],
+                                         r["check_id"], r["value"])
+            else:
+                scope, asin, cid, val = r[0], r[1], r[2], r[3]
+            if scope == "global":
+                out["global"][cid] = val
+            else:
+                out["byAsin"].setdefault(asin, {})[cid] = val
+        return out
+    finally:
+        conn.close()
+
+
+def save_comments(asin, comments=None, notes=None, validated_by="", brand=""):
+    """Store comment text (and notes) for an ASIN WITHOUT marking it done.
+
+    mark_done only runs when the validator presses Done, so anything typed and
+    then left — a comment on an ASIN they came back to later, a tab closed at
+    the end of the day — never reached the server at all. This is the autosave
+    path: it merges comments the same way mark_done does, and an ASIN it has
+    never seen is created with is_done='no' so the worklist is unaffected.
+    """
+    if not asin:
+        raise ValueError("asin is required")
+    init_validations()
+    asin = str(asin).strip()
+    now = datetime.now(timezone.utc).isoformat()
+    merged = merge_comments(stored_comments(asin), comments or {})
+
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT brand, is_done, validated_by, validated_at, check_results, notes "
+            f"FROM validations WHERE asin = {PLACEHOLDER}", (asin,))
+        row = cur.fetchone()
+        if row:
+            r = dict(row) if isinstance(row, dict) else {
+                "brand": row[0], "is_done": row[1], "validated_by": row[2],
+                "validated_at": row[3], "check_results": row[4], "notes": row[5]}
+            try:
+                decisions, _ = split_check_results(json.loads(r["check_results"] or "{}"))
+            except Exception:
+                decisions = {}
+            record = dict(decisions)
+            if merged:
+                record["comments"] = merged
+            # Nothing else moves: the answers, who validated it and when all
+            # stay put, because typing a comment is not re-validating.
+            cur.execute(
+                f"UPDATE validations SET check_results = {PLACEHOLDER}, "
+                f"notes = {PLACEHOLDER} WHERE asin = {PLACEHOLDER}",
+                (json.dumps(record, ensure_ascii=False),
+                 r["notes"] if notes is None else (notes or ""), asin))
+        else:
+            record = {"comments": merged} if merged else {}
+            fields = ["asin", "brand", "is_done", "validated_by",
+                      "validated_at", "check_results", "notes"]
+            vals = [asin, brand, "no", validated_by or "", now,
+                    json.dumps(record, ensure_ascii=False), notes or ""]
+            quoted = ", ".join(f'"{f}"' for f in fields)
+            marks = ", ".join([PLACEHOLDER] * len(fields))
+            if _IS_PG:
+                sql = (f'INSERT INTO validations ({quoted}) VALUES ({marks}) '
+                       f'ON CONFLICT (asin) DO NOTHING')
+            else:
+                sql = f'INSERT OR IGNORE INTO validations ({quoted}) VALUES ({marks})'
+            cur.execute(sql, vals)
+        conn.commit()
+        return merged
+    finally:
+        conn.close()
+
+
+def mark_done(asin, validated_by, check_results=None, notes=None, brand=""):
     """Record that `validated_by` has finished validating `asin`.
 
     check_results: dict of every check + its Yes/No/NotSure decision, plus an
@@ -507,6 +686,12 @@ def mark_done(asin, validated_by, check_results=None, notes="", brand=""):
     # cleared cache, deleted profile and new device — which is the whole point.
     decisions, incoming = split_check_results(check_results)
     comments = merge_comments(stored_comments(asin), incoming)
+    # notes=None means "no opinion" — keep whatever is stored. Only an actual
+    # string replaces it, so "" still clears the box on purpose. Without this,
+    # any save from a device that had not loaded the note blanked it: marking an
+    # ASIN done wiped the note typed against it minutes earlier.
+    if notes is None:
+        notes = stored_notes(asin)
     record = dict(decisions)
     if comments:
         record["comments"] = comments
@@ -597,8 +782,13 @@ def list_done_asins():
 
 def list_all_validations(brand=None):
     """Return EVERY validation record (full details) so any user can export the
-    whole team's work. Each row: asin, brand, validated_by, validated_at,
-    check_results (parsed), notes."""
+    whole team's work. Each row: asin, brand, is_done, validated_by,
+    validated_at, check_results (parsed), notes.
+
+    Rows that are NOT done are included — an ASIN can carry comments before
+    anyone presses Done (see save_comments), and leaving those out is how that
+    text would go missing again. Callers must read `is_done` rather than treat
+    the presence of a row as "validated"."""
     init_validations()
     conn = _connect()
     try:
@@ -608,11 +798,11 @@ def list_all_validations(brand=None):
             cur.execute(
                 f"SELECT asin, brand, is_done, validated_by, validated_at, "
                 f"check_results, notes FROM validations "
-                f"WHERE is_done='yes' AND LOWER(brand) LIKE {PLACEHOLDER}", (like,))
+                f"WHERE LOWER(brand) LIKE {PLACEHOLDER}", (like,))
         else:
             cur.execute(
                 "SELECT asin, brand, is_done, validated_by, validated_at, "
-                "check_results, notes FROM validations WHERE is_done='yes'")
+                "check_results, notes FROM validations")
         out = []
         for r in cur.fetchall():
             d = dict(r) if isinstance(r, dict) else {

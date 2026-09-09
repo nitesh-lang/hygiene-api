@@ -27,6 +27,10 @@ Endpoints (all JSON):
     GET  /progress?brand=             -> { total, done, remaining, by_validator }
     POST /validate                    -> save a "Mark Done"
          body: { asin, validated_by, check_results, notes, brand }
+    POST /comments                    -> autosave comment text, no "done"
+         body: { asin, comments, notes, validated_by, brand }
+    GET  /corrections                 -> the team's corrected values
+    POST /corrections                 -> upsert corrections
     GET  /validation/{asin}           -> the saved validation record (or null)
     GET  /specs                       -> our own dims/weight + volumetric per ASIN
     GET  /spec-changes?brand=         -> Amazon-side dims/weight changes over time
@@ -125,8 +129,25 @@ class ValidatePayload(BaseModel):
     asin: str
     validated_by: str
     check_results: Optional[Dict[str, Any]] = None
-    notes: Optional[str] = ""
+    # None = "no opinion, keep what is stored"; "" = the validator cleared it.
+    notes: Optional[str] = None
     brand: Optional[str] = ""
+
+
+class CommentsPayload(BaseModel):
+    """An autosave of the text typed against an ASIN's checks. Separate from
+    /validate because typing a comment is not the same as marking done."""
+    asin: str
+    comments: Optional[Dict[str, Any]] = None
+    notes: Optional[str] = None
+    validated_by: Optional[str] = ""
+    brand: Optional[str] = ""
+
+
+class CorrectionsPayload(BaseModel):
+    """{"global": {checkId: value}, "byAsin": {asin: {checkId: value}}}"""
+    corrections: Optional[Dict[str, Any]] = None
+    updated_by: Optional[str] = ""
 
 
 # ---------------------------------------------------------------- routes
@@ -282,7 +303,7 @@ def validate(payload: ValidatePayload):
             asin=payload.asin,
             validated_by=payload.validated_by,
             check_results=payload.check_results or {},
-            notes=payload.notes or "",
+            notes=payload.notes,
             brand=brand,
         )
     except Exception as e:
@@ -290,6 +311,47 @@ def validate(payload: ValidatePayload):
     return {"ok": True, "asin": payload.asin,
             "validated_by": payload.validated_by,
             "is_done": True}
+
+
+@app.post("/comments")
+def save_comments(payload: CommentsPayload):
+    """Autosave comment text WITHOUT marking the ASIN done.
+
+    Comments used to exist only in the browser that typed them, so a cleared
+    profile destroyed them. mark_done alone was not enough: text typed on an
+    ASIN the validator never finished would still have gone nowhere.
+    """
+    if not payload.asin:
+        raise HTTPException(status_code=400, detail="asin is required")
+    brand = (payload.brand or "").strip()
+    try:
+        stored = db.save_comments(
+            asin=payload.asin,
+            comments=payload.comments or {},
+            notes=payload.notes,
+            validated_by=payload.validated_by or "",
+            brand=brand,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"ok": True, "asin": payload.asin, "comments": len(stored)}
+
+
+@app.get("/corrections")
+def corrections_all():
+    """Every stored correction, so a new browser starts with the team's."""
+    return db.list_corrections()
+
+
+@app.post("/corrections")
+def corrections_save(payload: CorrectionsPayload):
+    """Upsert corrections. An empty value deletes that one; anything absent is
+    left alone, so a partial payload can never wipe the rest."""
+    try:
+        return db.save_corrections(payload.corrections or {},
+                                   updated_by=payload.updated_by or "")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/input")

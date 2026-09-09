@@ -104,5 +104,67 @@ db.mark_done("B0TEST0002", "Naresh More", brand="Audio Array",
 row = [v for v in db.list_all_validations() if v["asin"] == "B0TEST0002"][0]
 check("clean record stays clean", "comments" in row["check_results"], False)
 
+print("autosave: comments without marking done")
+db.save_comments("B0TEST0003", comments={"title": "typed but not finished"},
+                 validated_by="Naresh More", brand="Audio Array")
+check("the text is stored", comments_of("B0TEST0003"),
+      {"title": "typed but not finished"})
+check("the ASIN is NOT counted as validated", db.is_done("B0TEST0003"), False)
+check("it stays off the done list", "B0TEST0003" in db.list_done_asins(), False)
+row = [v for v in db.list_all_validations() if v["asin"] == "B0TEST0003"][0]
+check("but it IS returned so the text can come back", row["is_done"], "no")
+
+db.save_comments("B0TEST0003", comments={"colour": "wrong shade"})
+check("a second autosave merges", comments_of("B0TEST0003"),
+      {"title": "typed but not finished", "colour": "wrong shade"})
+db.mark_done("B0TEST0003", "Naresh More", brand="Audio Array",
+             check_results={"title": "No"})
+check("finishing it later keeps the typed text", comments_of("B0TEST0003"),
+      {"title": "typed but not finished", "colour": "wrong shade"})
+check("and now it is done", db.is_done("B0TEST0003"), True)
+
+print("autosave never disturbs a finished record")
+before = [v for v in db.list_all_validations() if v["asin"] == "B0TEST0001"][0]
+db.save_comments("B0TEST0001", comments={"colour": "added later"})
+after = [v for v in db.list_all_validations() if v["asin"] == "B0TEST0001"][0]
+check("validated_by is untouched", after["validated_by"], before["validated_by"])
+check("validated_at is untouched", after["validated_at"], before["validated_at"])
+check("the answers are untouched", decisions_of("B0TEST0001"),
+      {k: v for k, v in before["check_results"].items() if k != "comments"})
+
+print("notes are not blanked by omission")
+db.save_comments("B0TEST0004", comments={"title": "x"}, notes="check packaging",
+                 validated_by="Naresh More", brand="Audio Array")
+db.mark_done("B0TEST0004", "Nitesh Sharma", brand="Audio Array",
+             check_results={"title": "No"})
+notes_of = lambda a: [v for v in db.list_all_validations() if v["asin"] == a][0]["notes"]
+check("marking done keeps the note", notes_of("B0TEST0004"), "check packaging")
+db.mark_done("B0TEST0004", "Naresh More", brand="Audio Array",
+             check_results={"title": "No"}, notes="")
+check("an explicit empty string still clears it", notes_of("B0TEST0004"), "")
+db.mark_done("B0TEST0004", "Naresh More", brand="Audio Array",
+             check_results={"title": "No"}, notes="rewritten")
+check("and a real note replaces it", notes_of("B0TEST0004"), "rewritten")
+
+print("corrections survive the browser too")
+db.save_corrections({"global": {"packer": "Cambium Retail LLP"},
+                     "byAsin": {"B0TEST0001": {"colour": "Matte Black"}}},
+                    updated_by="Naresh More")
+got = db.list_corrections()
+check("a global correction round-trips", got["global"],
+      {"packer": "Cambium Retail LLP"})
+check("an ASIN correction round-trips", got["byAsin"],
+      {"B0TEST0001": {"colour": "Matte Black"}})
+db.save_corrections({"byAsin": {"B0TEST0002": {"material": "ABS"}}})
+check("a partial save leaves the others alone",
+      sorted(db.list_corrections()["byAsin"]), ["B0TEST0001", "B0TEST0002"])
+check("and keeps the global one", db.list_corrections()["global"],
+      {"packer": "Cambium Retail LLP"})
+db.save_corrections({"global": {"packer": ""}})
+check("an empty value deletes exactly that one",
+      db.list_corrections()["global"], {})
+check("without touching the ASIN-level ones",
+      sorted(db.list_corrections()["byAsin"]), ["B0TEST0001", "B0TEST0002"])
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)
