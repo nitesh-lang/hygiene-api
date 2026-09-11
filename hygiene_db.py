@@ -1953,6 +1953,115 @@ def clear_validations():
         conn.close()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# RESETS — start a set of ASINs (e.g. one brand) over for re-validation
+# ═══════════════════════════════════════════════════════════════════════════
+# Deleting rows on the server is not enough on its own: every browser still
+# holds its copy of the old work and would upload it straight back (the
+# catch-up Done push, the autosave). So each reset is recorded here. Browsers
+# read /resets and drop their copies of those ASINs, and any upload from a
+# browser that hasn't caught up yet is refused (see reset_blocks).
+
+def init_resets():
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS resets (
+            id {SERIAL},
+            brand {TEXT},
+            asins {TEXT},
+            reset_at {TEXT},
+            reset_by {TEXT}
+        );
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def reset_asins(brand, asins, reset_by=""):
+    """PERMANENTLY delete all saved work for `asins` — answers, comments, ticks,
+    notes, done marks, their history log entries and per-ASIN corrections —
+    and record the reset. One transaction: all of it happens or none of it.
+    Take a backup first; nothing here can be undone."""
+    asins = sorted({str(a).strip() for a in (asins or []) if str(a).strip()})
+    if not asins:
+        raise ValueError("no ASINs given")
+    init_validations()
+    init_corrections()
+    init_resets()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        vals = [brand or "", json.dumps(asins), now, reset_by or ""]
+        if _IS_PG:
+            cur.execute(
+                f"INSERT INTO resets (brand, asins, reset_at, reset_by) VALUES "
+                f"({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}) RETURNING id", vals)
+            reset_id = _scalar(cur.fetchone())
+        else:
+            cur.execute(
+                f"INSERT INTO resets (brand, asins, reset_at, reset_by) VALUES "
+                f"({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})", vals)
+            reset_id = cur.lastrowid
+        marks = ", ".join([PLACEHOLDER] * len(asins))
+        counts = {}
+        for table, extra in (("validations", ""), ("validations_history", ""),
+                             ("corrections", " AND scope = 'asin'")):
+            cur.execute(f"DELETE FROM {table} WHERE asin IN ({marks}){extra}", asins)
+            counts[table] = cur.rowcount
+        conn.commit()
+        return {"id": reset_id, "brand": brand, "asins": len(asins), "deleted": counts}
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def list_resets():
+    """Every reset, oldest first: [{id, brand, asins: [...], reset_at}]."""
+    init_resets()
+    conn = _connect()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, brand, asins, reset_at FROM resets ORDER BY id")
+        out = []
+        for r in cur.fetchall():
+            d = dict(r) if isinstance(r, dict) else {
+                "id": r[0], "brand": r[1], "asins": r[2], "reset_at": r[3]}
+            try:
+                d["asins"] = json.loads(d.get("asins") or "[]")
+            except Exception:
+                d["asins"] = []
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def latest_reset_for(asin, resets=None):
+    """Id of the newest reset covering `asin` (0 if it was never reset)."""
+    asin = str(asin or "").strip()
+    best = 0
+    for r in (resets if resets is not None else list_resets()):
+        if asin in r["asins"]:
+            best = max(best, int(r["id"]))
+    return best
+
+
+def reset_blocks(asin, seen, resets=None):
+    """True when an upload for `asin` comes from a browser that hasn't yet
+    caught up with a reset covering it — i.e. it would bring old work back."""
+    try:
+        seen = int(seen or 0)
+    except (TypeError, ValueError):
+        seen = 0
+    return latest_reset_for(asin, resets) > seen
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------

@@ -119,6 +119,7 @@ def _startup():
         db.init_input_sheet()
         db.init_users()
         db.init_product_specs()
+        db.init_resets()
     except Exception as e:
         # don't crash the service; /health will report the backend
         print("startup init warning:", e)
@@ -132,6 +133,8 @@ class ValidatePayload(BaseModel):
     # None = "no opinion, keep what is stored"; "" = the validator cleared it.
     notes: Optional[str] = None
     brand: Optional[str] = ""
+    # Newest reset this browser has applied (see /resets). 0 from old clients.
+    reset_seen: Optional[int] = 0
 
 
 class CommentsPayload(BaseModel):
@@ -148,12 +151,23 @@ class CommentsPayload(BaseModel):
     verified: Optional[Dict[str, Any]] = None
     # True = only add what the server is missing, never change a stored value.
     only_fill: Optional[bool] = False
+    reset_seen: Optional[int] = 0
 
 
 class CorrectionsPayload(BaseModel):
     """{"global": {checkId: value}, "byAsin": {asin: {checkId: value}}}"""
     corrections: Optional[Dict[str, Any]] = None
     updated_by: Optional[str] = ""
+    reset_seen: Optional[int] = 0
+
+
+def _refuse_if_reset(asin, seen):
+    """409 when this upload would bring back work that a reset deleted: the
+    sending browser still holds pre-reset data and hasn't read /resets yet."""
+    if db.reset_blocks(asin, seen):
+        raise HTTPException(
+            status_code=409,
+            detail="This ASIN was reset for re-validation. Reload the page to continue.")
 
 
 # ---------------------------------------------------------------- routes
@@ -168,7 +182,8 @@ def health():
         # "autosave" names what /comments stores, so a deploy can be checked
         # from outside (every other route needs a login).
         return {"ok": True, "backend": db.backend_name(), "db": "up",
-                "autosave": ["comments", "notes", "answers", "ticks"]}
+                "autosave": ["comments", "notes", "answers", "ticks"],
+                "resets": True}
     except Exception as e:
         return JSONResponse(
             {"ok": False, "backend": db.backend_name(), "db": "down",
@@ -296,6 +311,7 @@ def validate(payload: ValidatePayload):
     if not payload.asin or not payload.validated_by:
         raise HTTPException(status_code=400,
                             detail="asin and validated_by are required")
+    _refuse_if_reset(payload.asin, payload.reset_seen)
     # Fill the brand from the crawl when the client can't supply it (the app's
     # offline-catch-up push runs before the product list has loaded). Without
     # this the row stores brand='' and /progress?brand=... — which matches on
@@ -332,6 +348,7 @@ def save_comments(payload: CommentsPayload):
     """
     if not payload.asin:
         raise HTTPException(status_code=400, detail="asin is required")
+    _refuse_if_reset(payload.asin, payload.reset_seen)
     brand = (payload.brand or "").strip()
     try:
         stored = db.save_comments(
@@ -359,11 +376,24 @@ def corrections_all():
 def corrections_save(payload: CorrectionsPayload):
     """Upsert corrections. An empty value deletes that one; anything absent is
     left alone, so a partial payload can never wipe the rest."""
+    corr = dict(payload.corrections or {})
+    # Per-ASIN corrections for reset ASINs from a browser that hasn't caught up
+    # are old work: drop just those, keep the rest of the save.
+    resets = db.list_resets()
+    if resets and isinstance(corr.get("byAsin"), dict):
+        corr["byAsin"] = {a: c for a, c in corr["byAsin"].items()
+                          if not db.reset_blocks(a, payload.reset_seen, resets)}
     try:
-        return db.save_corrections(payload.corrections or {},
-                                   updated_by=payload.updated_by or "")
+        return db.save_corrections(corr, updated_by=payload.updated_by or "")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/resets")
+def resets():
+    """Every reset (id, brand, ASINs, when). Browsers drop their local copy of
+    any reset newer than the last one they applied."""
+    return db.list_resets()
 
 
 @app.get("/input")

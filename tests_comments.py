@@ -211,5 +211,32 @@ db.mark_done("B0TEST0005", "Nitesh Sharma", brand="Audio Array",
              check_results={"title": "Yes", "verified": {"material": False}})
 check("Done can untick on purpose", ticks_of("B0TEST0005"), {"title": True})
 
+print("reset a brand for re-validation")
+db.save_corrections({"global": {"packer": "keep me"},
+                     "byAsin": {"B0TEST0005": {"colour": "old"}}})
+check("nothing is blocked before any reset", db.reset_blocks("B0TEST0005", 0), False)
+res = db.reset_asins("Nexlev", ["B0TEST0005", "B0TEST0004", "B0NEVERSEEN"], reset_by="test")
+check("the ASINs' work is gone", db.stored_record("B0TEST0005"), {})
+check("no longer done", db.is_done("B0TEST0005"), False)
+check("their history is gone", res["deleted"]["validations_history"] > 0, True)
+check("their per-ASIN correction is gone",
+      "B0TEST0005" in db.list_corrections()["byAsin"], False)
+check("a global correction survives", db.list_corrections()["global"], {"packer": "keep me"})
+check("other ASINs are untouched", comments_of("B0TEST0001"), {"title": "wrong model no", "colour": "added later"})
+check("the reset is listed", [r["brand"] for r in db.list_resets()], ["Nexlev"])
+check("a browser that hasn't caught up is blocked", db.reset_blocks("B0TEST0005", 0), True)
+check("one that has is allowed", db.reset_blocks("B0TEST0005", res["id"]), False)
+check("ASINs outside the reset are never blocked", db.reset_blocks("B0TEST0001", 0), False)
+db.save_comments("B0TEST0005", decisions={"title": "Yes"})
+check("fresh work after the reset saves normally", answers_of("B0TEST0005"), {"title": "Yes"})
+res2 = db.reset_asins("Nexlev", ["B0TEST0005"])
+check("a second reset gets a newer id", res2["id"] > res["id"], True)
+check("the newest reset is what counts", db.reset_blocks("B0TEST0005", res["id"]), True)
+try:
+    db.reset_asins("Nexlev", [])
+    check("an empty reset is refused", False, True)
+except ValueError:
+    check("an empty reset is refused", True, True)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)
