@@ -166,5 +166,50 @@ check("an empty value deletes exactly that one",
 check("without touching the ASIN-level ones",
       sorted(db.list_corrections()["byAsin"]), ["B0TEST0001", "B0TEST0002"])
 
+print("answers and ticks live on the server too (2026-09-11)")
+ticks_of = lambda a: db.verified_of(db.stored_record(a))
+answers_of = lambda a: db.split_check_results(db.stored_record(a))[0]
+check("the verified key is not mistaken for an answer",
+      db.split_check_results({"title": "No", "verified": {"title": True}})[0], {"title": "No"})
+db.save_comments("B0TEST0005", decisions={"title": "No", "colour": "Yes"},
+                 verified={"title": True}, validated_by="Naresh More")
+check("answers on an unfinished ASIN are stored", answers_of("B0TEST0005"),
+      {"title": "No", "colour": "Yes"})
+check("ticks are stored", ticks_of("B0TEST0005"), {"title": True})
+check("and the ASIN is still not done", db.is_done("B0TEST0005"), False)
+db.save_comments("B0TEST0005", decisions={"colour": "No"}, verified={"colour": True})
+check("a changed answer updates just that one", answers_of("B0TEST0005"),
+      {"title": "No", "colour": "No"})
+check("ticks merge", ticks_of("B0TEST0005"), {"title": True, "colour": True})
+db.save_comments("B0TEST0005", comments={"title": "wrong"})
+check("a comments-only save leaves answers alone", answers_of("B0TEST0005"),
+      {"title": "No", "colour": "No"})
+check("and leaves ticks alone", ticks_of("B0TEST0005"), {"title": True, "colour": True})
+db.save_comments("B0TEST0005", decisions={"colour": ""}, verified={"colour": False})
+check("clearing an answer removes it", answers_of("B0TEST0005"), {"title": "No"})
+check("unticking removes the tick", ticks_of("B0TEST0005"), {"title": True})
+check("the comment rode through untouched", comments_of("B0TEST0005"), {"title": "wrong"})
+
+print("only_fill can add but never overrule")
+db.save_comments("B0TEST0005", decisions={"title": "Yes", "material": "Yes"},
+                 verified={"title": False, "material": True}, only_fill=True)
+check("a stored answer is not changed", answers_of("B0TEST0005")["title"], "No")
+check("a missing answer is added", answers_of("B0TEST0005")["material"], "Yes")
+check("a stored tick is not removed", ticks_of("B0TEST0005"),
+      {"title": True, "material": True})
+
+print("Done keeps what the browser didn't send")
+db.mark_done("B0TEST0005", "Nitesh Sharma", brand="Audio Array",
+             check_results={"title": "Yes"})
+check("Done's answer wins", answers_of("B0TEST0005")["title"], "Yes")
+check("an autosaved answer Done didn't mention is kept",
+      answers_of("B0TEST0005").get("material"), "Yes")
+check("ticks survive a Done that sends none", ticks_of("B0TEST0005"),
+      {"title": True, "material": True})
+check("comments survive it too", comments_of("B0TEST0005"), {"title": "wrong"})
+db.mark_done("B0TEST0005", "Nitesh Sharma", brand="Audio Array",
+             check_results={"title": "Yes", "verified": {"material": False}})
+check("Done can untick on purpose", ticks_of("B0TEST0005"), {"title": True})
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)

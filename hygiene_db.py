@@ -429,6 +429,10 @@ def init_validations():
         conn.close()
 
 
+# Keys inside check_results that are NOT check decisions.
+RESERVED_KEYS = ("comments", "verified")
+
+
 def split_check_results(check_results):
     """Separate a check_results payload into {checkId: decision} and the
     per-check comment texts the validator typed.
@@ -443,8 +447,52 @@ def split_check_results(check_results):
     if isinstance(raw, dict):
         for k, v in raw.items():
             comments[str(k)] = "" if v is None else str(v)
-    decisions = {k: v for k, v in cr.items() if k != "comments"}
+    decisions = {k: v for k, v in cr.items() if k not in RESERVED_KEYS}
     return decisions, comments
+
+
+def verified_of(check_results):
+    """The per-check "verified" ticks, stored under the reserved "verified" key
+    as {checkId: True}. Only ticked checks are kept."""
+    raw = check_results.get("verified") if isinstance(check_results, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {str(k): True for k, v in raw.items() if v is True}
+
+
+def merge_answers(existing, incoming, only_fill=False):
+    """Fold autosaved Yes/No answers into what is stored.
+
+    Same rule as comments: a key absent from the save keeps its stored answer,
+    and only an explicit "" removes one. With only_fill, nothing stored is ever
+    changed — the save can only add answers the server does not have yet. That
+    is how a browser uploads work it was holding without overruling a teammate
+    who has since re-validated the same ASIN.
+    """
+    out = dict(existing or {})
+    for k, v in (incoming or {}).items():
+        if not isinstance(v, str) or k in RESERVED_KEYS:
+            continue
+        if only_fill:
+            if v.strip() and k not in out:
+                out[k] = v
+        elif v.strip():
+            out[k] = v
+        else:
+            out.pop(k, None)
+    return out
+
+
+def merge_ticks(existing, incoming, only_fill=False):
+    """Fold "verified" ticks into what is stored: True ticks, False unticks,
+    absent keeps. With only_fill a save can only add ticks, never remove one."""
+    out = dict(existing or {})
+    for k, v in (incoming or {}).items():
+        if v is True:
+            out[str(k)] = True
+        elif v is False and not only_fill:
+            out.pop(str(k), None)
+    return out
 
 
 def merge_comments(existing, incoming):
@@ -481,8 +529,8 @@ def stored_notes(asin):
         conn.close()
 
 
-def stored_comments(asin):
-    """The comment texts currently stored for an ASIN ({} when there are none)."""
+def stored_record(asin):
+    """The parsed check_results currently stored for an ASIN ({} when none)."""
     init_validations()
     conn = _connect()
     try:
@@ -495,12 +543,17 @@ def stored_comments(asin):
             return {}
         raw = row["check_results"] if isinstance(row, dict) else row[0]
         try:
-            _, comments = split_check_results(json.loads(raw or "{}"))
+            cr = json.loads(raw or "{}")
         except Exception:
             return {}
-        return comments
+        return cr if isinstance(cr, dict) else {}
     finally:
         conn.close()
+
+
+def stored_comments(asin):
+    """The comment texts currently stored for an ASIN ({} when there are none)."""
+    return split_check_results(stored_record(asin))[1]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -605,14 +658,19 @@ def list_corrections():
         conn.close()
 
 
-def save_comments(asin, comments=None, notes=None, validated_by="", brand=""):
-    """Store comment text (and notes) for an ASIN WITHOUT marking it done.
+def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
+                  decisions=None, verified=None, only_fill=False):
+    """Store work on an ASIN WITHOUT marking it done: comment text, notes, and
+    (since 2026-09-11) the Yes/No answers and "verified" ticks.
 
     mark_done only runs when the validator presses Done, so anything typed and
     then left — a comment on an ASIN they came back to later, a tab closed at
     the end of the day — never reached the server at all. This is the autosave
     path: it merges comments the same way mark_done does, and an ASIN it has
     never seen is created with is_done='no' so the worklist is unaffected.
+    Answers and ticks merge by the same never-drop-by-omission rule; None for
+    either means "no opinion" and leaves them exactly as stored. only_fill
+    applies to answers and ticks: add what is missing, change nothing.
     """
     if not asin:
         raise ValueError("asin is required")
@@ -633,21 +691,34 @@ def save_comments(asin, comments=None, notes=None, validated_by="", brand=""):
                 "brand": row[0], "is_done": row[1], "validated_by": row[2],
                 "validated_at": row[3], "check_results": row[4], "notes": row[5]}
             try:
-                decisions, _ = split_check_results(json.loads(r["check_results"] or "{}"))
+                stored = json.loads(r["check_results"] or "{}")
             except Exception:
-                decisions = {}
-            record = dict(decisions)
+                stored = {}
+            answers, _ = split_check_results(stored)
+            ticks = verified_of(stored)
+            if decisions is not None:
+                answers = merge_answers(answers, decisions, only_fill)
+            if verified is not None:
+                ticks = merge_ticks(ticks, verified, only_fill)
+            record = dict(answers)
             if merged:
                 record["comments"] = merged
-            # Nothing else moves: the answers, who validated it and when all
-            # stay put, because typing a comment is not re-validating.
+            if ticks:
+                record["verified"] = ticks
+            # Nothing else moves: who validated it, when, and whether it is
+            # done all stay put, because autosaving is not re-validating.
             cur.execute(
                 f"UPDATE validations SET check_results = {PLACEHOLDER}, "
                 f"notes = {PLACEHOLDER} WHERE asin = {PLACEHOLDER}",
                 (json.dumps(record, ensure_ascii=False),
                  r["notes"] if notes is None else (notes or ""), asin))
         else:
-            record = {"comments": merged} if merged else {}
+            record = merge_answers({}, decisions or {})
+            if merged:
+                record["comments"] = merged
+            ticks = merge_ticks({}, verified or {})
+            if ticks:
+                record["verified"] = ticks
             fields = ["asin", "brand", "is_done", "validated_by",
                       "validated_at", "check_results", "notes"]
             vals = [asin, brand, "no", validated_by or "", now,
@@ -685,16 +756,24 @@ def mark_done(asin, validated_by, check_results=None, notes=None, brand=""):
     # saw them cannot wipe what somebody else typed. They then survive every
     # cleared cache, deleted profile and new device — which is the whole point.
     decisions, incoming = split_check_results(check_results)
-    comments = merge_comments(stored_comments(asin), incoming)
+    stored = stored_record(asin)
+    comments = merge_comments(split_check_results(stored)[1], incoming)
+    # Ticks likewise: a Done from a browser that sends none keeps the stored ones.
+    raw_ticks = check_results.get("verified") if isinstance(check_results, dict) else None
+    ticks = merge_ticks(verified_of(stored), raw_ticks if isinstance(raw_ticks, dict) else {})
     # notes=None means "no opinion" — keep whatever is stored. Only an actual
     # string replaces it, so "" still clears the box on purpose. Without this,
     # any save from a device that had not loaded the note blanked it: marking an
     # ASIN done wiped the note typed against it minutes earlier.
     if notes is None:
         notes = stored_notes(asin)
-    record = dict(decisions)
+    # Answers sent with Done win, but one the payload doesn't mention — say an
+    # answer autosaved from another PC — is kept rather than dropped.
+    record = {**split_check_results(stored)[0], **decisions}
     if comments:
         record["comments"] = comments
+    if ticks:
+        record["verified"] = ticks
     cr_json = json.dumps(record, ensure_ascii=False)
 
     conn = _connect()

@@ -142,6 +142,12 @@ class CommentsPayload(BaseModel):
     notes: Optional[str] = None
     validated_by: Optional[str] = ""
     brand: Optional[str] = ""
+    # Yes/No answers and "verified" ticks, so work on an unfinished ASIN lives
+    # on the server and not just in one browser. None = leave as stored.
+    decisions: Optional[Dict[str, Any]] = None
+    verified: Optional[Dict[str, Any]] = None
+    # True = only add what the server is missing, never change a stored value.
+    only_fill: Optional[bool] = False
 
 
 class CorrectionsPayload(BaseModel):
@@ -159,7 +165,10 @@ def health():
     route was 500ing."""
     try:
         db.list_done_asins()
-        return {"ok": True, "backend": db.backend_name(), "db": "up"}
+        # "autosave" names what /comments stores, so a deploy can be checked
+        # from outside (every other route needs a login).
+        return {"ok": True, "backend": db.backend_name(), "db": "up",
+                "autosave": ["comments", "notes", "answers", "ticks"]}
     except Exception as e:
         return JSONResponse(
             {"ok": False, "backend": db.backend_name(), "db": "down",
@@ -331,6 +340,9 @@ def save_comments(payload: CommentsPayload):
             notes=payload.notes,
             validated_by=payload.validated_by or "",
             brand=brand,
+            decisions=payload.decisions,
+            verified=payload.verified,
+            only_fill=bool(payload.only_fill),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
