@@ -430,7 +430,11 @@ def init_validations():
 
 
 # Keys inside check_results that are NOT check decisions.
-RESERVED_KEYS = ("comments", "verified")
+RESERVED_KEYS = ("comments", "verified", "stock")
+
+# The listing's stock status, picked from the dropdown above the checks and
+# stored under the reserved "stock" key. Absent = never picked (treated as Active).
+STOCK_VALUES = ("Active", "Out of stock")
 
 
 def split_check_results(check_results):
@@ -458,6 +462,22 @@ def verified_of(check_results):
     if not isinstance(raw, dict):
         return {}
     return {str(k): True for k, v in raw.items() if v is True}
+
+
+def stock_of(check_results):
+    """The stored stock status ("" when none was ever picked)."""
+    raw = check_results.get("stock") if isinstance(check_results, dict) else None
+    return raw if raw in STOCK_VALUES else ""
+
+
+def merge_stock(existing, incoming, only_fill=False):
+    """None keeps the stored status, "" clears it, a known value sets it.
+    With only_fill a save can only fill a status that is missing."""
+    if incoming is None or (incoming and incoming not in STOCK_VALUES):
+        return existing or ""
+    if only_fill:
+        return existing or incoming
+    return incoming
 
 
 def merge_answers(existing, incoming, only_fill=False):
@@ -659,9 +679,10 @@ def list_corrections():
 
 
 def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
-                  decisions=None, verified=None, only_fill=False):
+                  decisions=None, verified=None, only_fill=False, stock=None):
     """Store work on an ASIN WITHOUT marking it done: comment text, notes, and
-    (since 2026-09-11) the Yes/No answers and "verified" ticks.
+    (since 2026-09-11) the Yes/No answers and "verified" ticks, and (since
+    2026-09-15) the Active / Out of stock status.
 
     mark_done only runs when the validator presses Done, so anything typed and
     then left — a comment on an ASIN they came back to later, a tab closed at
@@ -700,11 +721,14 @@ def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
                 answers = merge_answers(answers, decisions, only_fill)
             if verified is not None:
                 ticks = merge_ticks(ticks, verified, only_fill)
+            status = merge_stock(stock_of(stored), stock, only_fill)
             record = dict(answers)
             if merged:
                 record["comments"] = merged
             if ticks:
                 record["verified"] = ticks
+            if status:
+                record["stock"] = status
             # Nothing else moves: who validated it, when, and whether it is
             # done all stay put, because autosaving is not re-validating.
             cur.execute(
@@ -719,6 +743,9 @@ def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
             ticks = merge_ticks({}, verified or {})
             if ticks:
                 record["verified"] = ticks
+            status = merge_stock("", stock)
+            if status:
+                record["stock"] = status
             fields = ["asin", "brand", "is_done", "validated_by",
                       "validated_at", "check_results", "notes"]
             vals = [asin, brand, "no", validated_by or "", now,
@@ -774,6 +801,11 @@ def mark_done(asin, validated_by, check_results=None, notes=None, brand=""):
         record["comments"] = comments
     if ticks:
         record["verified"] = ticks
+    # Stock status: a Done that doesn't send one keeps the stored status.
+    raw_stock = check_results.get("stock") if isinstance(check_results, dict) else None
+    status = merge_stock(stock_of(stored), raw_stock)
+    if status:
+        record["stock"] = status
     cr_json = json.dumps(record, ensure_ascii=False)
 
     conn = _connect()

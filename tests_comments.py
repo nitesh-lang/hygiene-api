@@ -211,6 +211,26 @@ db.mark_done("B0TEST0005", "Nitesh Sharma", brand="Audio Array",
              check_results={"title": "Yes", "verified": {"material": False}})
 check("Done can untick on purpose", ticks_of("B0TEST0005"), {"title": True})
 
+print("stock status (2026-09-15)")
+stock_now = lambda a: db.stock_of(db.stored_record(a))
+check("the stock key is not mistaken for an answer",
+      db.split_check_results({"title": "No", "stock": "Out of stock"})[0], {"title": "No"})
+db.save_comments("B0TEST0006", stock="Out of stock", validated_by="Naresh More")
+check("autosave stores it on a new row", stock_now("B0TEST0006"), "Out of stock")
+db.save_comments("B0TEST0006", decisions={"title": "No"}, comments={"title": "x"})
+check("a save without stock keeps it", stock_now("B0TEST0006"), "Out of stock")
+db.save_comments("B0TEST0006", stock="Active", only_fill=True)
+check("only_fill never overrules it", stock_now("B0TEST0006"), "Out of stock")
+db.save_comments("B0TEST0006", stock="junk")
+check("an unknown value is ignored", stock_now("B0TEST0006"), "Out of stock")
+db.mark_done("B0TEST0006", "Naresh More", check_results={"title": "Yes"})
+check("a Done that sends none keeps it", stock_now("B0TEST0006"), "Out of stock")
+check("and Done kept the comment", comments_of("B0TEST0006"), {"title": "x"})
+db.mark_done("B0TEST0006", "Naresh More", check_results={"title": "Yes", "stock": "Active"})
+check("Done can change it", stock_now("B0TEST0006"), "Active")
+db.save_comments("B0TEST0006", stock="")
+check("an explicit empty string clears it", stock_now("B0TEST0006"), "")
+
 print("reset a brand for re-validation")
 db.save_corrections({"global": {"packer": "keep me"},
                      "byAsin": {"B0TEST0005": {"colour": "old"}}})

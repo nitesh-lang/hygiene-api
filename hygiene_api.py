@@ -151,6 +151,8 @@ class CommentsPayload(BaseModel):
     verified: Optional[Dict[str, Any]] = None
     # True = only add what the server is missing, never change a stored value.
     only_fill: Optional[bool] = False
+    # "Active" / "Out of stock"; None = leave as stored, "" = clear.
+    stock: Optional[str] = None
     reset_seen: Optional[int] = 0
 
 
@@ -182,7 +184,7 @@ def health():
         # "autosave" names what /comments stores, so a deploy can be checked
         # from outside (every other route needs a login).
         return {"ok": True, "backend": db.backend_name(), "db": "up",
-                "autosave": ["comments", "notes", "answers", "ticks"],
+                "autosave": ["comments", "notes", "answers", "ticks", "stock"],
                 "resets": True}
     except Exception as e:
         return JSONResponse(
@@ -360,6 +362,7 @@ def save_comments(payload: CommentsPayload):
             decisions=payload.decisions,
             verified=payload.verified,
             only_fill=bool(payload.only_fill),
+            stock=payload.stock,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
