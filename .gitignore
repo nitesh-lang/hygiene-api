@@ -43,3 +43,6 @@ env/
 .vscode/
 .idea/
 .DS_Store
+
+# Scheduled Neon snapshots (business data + password hashes)
+auto_backups/

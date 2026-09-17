@@ -422,6 +422,24 @@ def init_validations():
             notes {TEXT}
         );
         """)
+        # Append-only record of every single change to saved work: each answer,
+        # comment, tick, stock status, note and done mark, old value and new,
+        # plus a full copy of every row a reset removes. NOTHING in this code
+        # ever deletes from it, so any answer can always be brought back.
+        cur.execute(f"""
+        CREATE TABLE IF NOT EXISTS work_log (
+            id {SERIAL},
+            asin {TEXT},
+            kind {TEXT},
+            check_id {TEXT},
+            old_value {TEXT},
+            new_value {TEXT},
+            changed_by {TEXT},
+            changed_at {TEXT},
+            source {TEXT}
+        );
+        """)
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_worklog_asin ON work_log (asin);')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_val_asin ON validations (asin);')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_val_done ON validations (is_done);')
         conn.commit()
@@ -694,6 +712,37 @@ def list_corrections():
         conn.close()
 
 
+def _log_row(cur, asin, kind, check_id, old, new, by, at, source):
+    cur.execute(
+        f"INSERT INTO work_log (asin, kind, check_id, old_value, new_value, "
+        f"changed_by, changed_at, source) VALUES ({', '.join([PLACEHOLDER] * 8)})",
+        (asin, kind, check_id or "", "" if old is None else str(old),
+         "" if new is None else str(new), by or "", at, source))
+
+
+def log_work_changes(cur, asin, old_cr, new_cr, by, at, source,
+                     old_notes=None, new_notes=None, old_done=None, new_done=None):
+    """Write one work_log row per value that differs between the stored record
+    and the one about to be saved. Runs inside the caller's transaction, so a
+    change is never saved without its log entry."""
+    old_cr = old_cr if isinstance(old_cr, dict) else {}
+    new_cr = new_cr if isinstance(new_cr, dict) else {}
+    old_a, old_c = split_check_results(old_cr)
+    new_a, new_c = split_check_results(new_cr)
+    parts = (("answer", old_a, new_a), ("comment", old_c, new_c),
+             ("tick", verified_of(old_cr), verified_of(new_cr)))
+    for kind, o, n in parts:
+        for k in sorted(set(o) | set(n)):
+            if o.get(k) != n.get(k):
+                _log_row(cur, asin, kind, k, o.get(k), n.get(k), by, at, source)
+    if stock_of(old_cr) != stock_of(new_cr):
+        _log_row(cur, asin, "stock", "", stock_of(old_cr), stock_of(new_cr), by, at, source)
+    if new_notes is not None and (old_notes or "") != (new_notes or ""):
+        _log_row(cur, asin, "notes", "", old_notes, new_notes, by, at, source)
+    if new_done is not None and (old_done or "") != (new_done or ""):
+        _log_row(cur, asin, "done", "", old_done, new_done, by, at, source)
+
+
 def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
                   decisions=None, verified=None, only_fill=False, stock=None):
     """Store work on an ASIN WITHOUT marking it done: comment text, notes, and
@@ -745,6 +794,9 @@ def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
                 record["verified"] = ticks
             if status:
                 record["stock"] = status
+            log_work_changes(cur, asin, stored, record, validated_by, now, "autosave",
+                             old_notes=r["notes"],
+                             new_notes=r["notes"] if notes is None else (notes or ""))
             # Nothing else moves: who validated it, when, and whether it is
             # done all stay put, because autosaving is not re-validating.
             cur.execute(
@@ -774,6 +826,9 @@ def save_comments(asin, comments=None, notes=None, validated_by="", brand="",
             else:
                 sql = f'INSERT OR IGNORE INTO validations ({quoted}) VALUES ({marks})'
             cur.execute(sql, vals)
+            if cur.rowcount == 1:
+                log_work_changes(cur, asin, {}, record, validated_by, now, "autosave",
+                                 old_notes="", new_notes=notes or "")
         conn.commit()
         return merged
     finally:
@@ -835,6 +890,13 @@ def mark_done(asin, validated_by, check_results=None, notes=None, brand=""):
         vals = [asin, brand, "yes", validated_by, now, cr_json, notes or ""]
         quoted = ", ".join(f'"{f}"' for f in fields)
         marks = ", ".join([PLACEHOLDER] * len(fields))
+        cur.execute(f"SELECT is_done, notes FROM validations WHERE asin = {PLACEHOLDER}", (asin,))
+        prev = cur.fetchone()
+        prev = (dict(prev) if isinstance(prev, dict) else
+                {"is_done": prev[0], "notes": prev[1]}) if prev else {}
+        log_work_changes(cur, asin, stored, record, validated_by, now, "done",
+                         old_notes=prev.get("notes"), new_notes=notes or "",
+                         old_done=prev.get("is_done"), new_done="yes")
         if _IS_PG:
             updates = ", ".join(f'"{f}" = EXCLUDED."{f}"'
                                 for f in fields if f != "asin")
@@ -1985,13 +2047,26 @@ def delete_session(token):
         conn.close()
 
 
-def clear_validations():
+def clear_validations(confirm=""):
     """Delete ALL validation records (and history) so the team starts fresh at 0.
-    Products and input sheet are untouched."""
+    Products and input sheet are untouched. Refuses unless confirm is exactly
+    "DELETE ALL WORK", and copies every row into work_log first."""
+    if confirm != "DELETE ALL WORK":
+        raise PermissionError("clear_validations deletes everyone's work; "
+                              "it needs confirm='DELETE ALL WORK' and a backup first")
     init_validations()
     conn=_connect()
     try:
         cur=conn.cursor()
+        now = datetime.now(timezone.utc).isoformat()
+        for table in ("validations", "validations_history"):
+            cur.execute(f"SELECT * FROM {table}")
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rec = dict(row) if isinstance(row, dict) else dict(zip(cols, row))
+                _log_row(cur, rec.get("asin"), "clear-removed", table,
+                         json.dumps(rec, ensure_ascii=False, default=str), "",
+                         "clear-validations", now, "clear-validations")
         cur.execute("DELETE FROM validations")
         try:
             cur.execute("DELETE FROM validations_history")
@@ -2034,7 +2109,7 @@ def reset_asins(brand, asins, reset_by=""):
     """PERMANENTLY delete all saved work for `asins` — answers, comments, ticks,
     notes, done marks, their history log entries and per-ASIN corrections —
     and record the reset. One transaction: all of it happens or none of it.
-    Take a backup first; nothing here can be undone."""
+    Every removed row is first copied into work_log, so it can be brought back."""
     asins = sorted({str(a).strip() for a in (asins or []) if str(a).strip()})
     if not asins:
         raise ValueError("no ASINs given")
@@ -2057,6 +2132,17 @@ def reset_asins(brand, asins, reset_by=""):
                 f"({PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER}, {PLACEHOLDER})", vals)
             reset_id = cur.lastrowid
         marks = ", ".join([PLACEHOLDER] * len(asins))
+        # Keep a full copy of every row about to go, in the never-deleted
+        # work_log, so a reset can always be undone.
+        for table, extra in (("validations", ""), ("validations_history", ""),
+                             ("corrections", " AND scope = 'asin'")):
+            cur.execute(f"SELECT * FROM {table} WHERE asin IN ({marks}){extra}", asins)
+            cols = [d[0] for d in cur.description]
+            for row in cur.fetchall():
+                rec = dict(row) if isinstance(row, dict) else dict(zip(cols, row))
+                _log_row(cur, rec.get("asin"), "reset-removed", table,
+                         json.dumps(rec, ensure_ascii=False, default=str), "",
+                         reset_by, now, f"reset {reset_id}")
         counts = {}
         for table, extra in (("validations", ""), ("validations_history", ""),
                              ("corrections", " AND scope = 'asin'")):
@@ -2262,7 +2348,8 @@ if __name__ == "__main__":
         print("  Fill ONLY our own measured values — packed/shipping box, not the")
         print("  bare product. Amazon's side is read from the crawl automatically.")
     elif cmd == "clear-validations":
-        clear_validations()
+        # python hygiene_db.py clear-validations "DELETE ALL WORK"
+        clear_validations(args[1] if len(args) > 1 else "")
         print(f"Cleared ALL validations into {backend_name()} — everyone starts at 0.")
     elif cmd == "add-user":
         # python hygiene_db.py add-user "Naresh More" <password> [admin]

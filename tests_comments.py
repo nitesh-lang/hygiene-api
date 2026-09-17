@@ -274,5 +274,40 @@ try:
 except ValueError:
     check("an empty reset is refused", True, True)
 
+print("work_log keeps every change, and nothing removes it (2026-09-17)")
+import sqlite3  # noqa: E402
+
+
+def log_rows(asin, kind=None):
+    conn = sqlite3.connect(os.environ["HYGIENE_SQLITE"])
+    q = "SELECT kind, check_id, old_value, new_value, source FROM work_log WHERE asin=?"
+    rows = conn.execute(q + " ORDER BY id", (asin,)).fetchall()
+    conn.close()
+    return [r for r in rows if kind is None or r[0] == kind]
+
+
+db.save_comments("B0TEST0007", decisions={"title": "Yes"}, comments={"title": "ok"})
+db.save_comments("B0TEST0007", decisions={"title": "No"})
+db.mark_done("B0TEST0007", "Naresh More", check_results={"title": "No", "colour": "Yes"})
+check("each answer change is logged with old and new",
+      [r[2:4] for r in log_rows("B0TEST0007", "answer")],
+      [("", "Yes"), ("Yes", "No"), ("", "Yes")])
+check("the comment is logged", [r[1:4] for r in log_rows("B0TEST0007", "comment")],
+      [("title", "", "ok")])
+check("Done is logged", [r[2:4] for r in log_rows("B0TEST0007", "done")], [("no", "yes")])
+before = len(log_rows("B0TEST0007"))
+db.reset_asins("Nexlev", ["B0TEST0007"], reset_by="test")
+removed = log_rows("B0TEST0007", "reset-removed")
+check("a reset keeps a full copy of what it removed",
+      any(json.loads(r[2]).get("asin") == "B0TEST0007" and "No" in json.loads(r[2])["check_results"]
+          for r in removed if r[1] == "validations"), True)
+check("a reset never deletes log rows", len(log_rows("B0TEST0007")) >= before + len(removed), True)
+try:
+    db.clear_validations()
+    check("clear-validations refuses without the confirmation", False, True)
+except PermissionError:
+    check("clear-validations refuses without the confirmation", True, True)
+check("and nothing was cleared", comments_of("B0TEST0001") != {}, True)
+
 print(f"\n{PASS} passed, {FAIL} failed")
 raise SystemExit(1 if FAIL else 0)
