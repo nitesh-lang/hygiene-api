@@ -86,6 +86,22 @@ db.mark_done("B0TEST0001", "Naresh More", brand="Audio Array",
 check("clearing the box removes just that one", comments_of("B0TEST0001"),
       {"title": "wrong model no"})
 
+print("Done never turns a saved Yes/No into a non-answer")
+db.mark_done("B0TEST0002", "Naresh More", brand="Nexlev",
+             check_results={"title": "Yes", "colour": "No", "packer": "REVIEW"})
+db.mark_done("B0TEST0002", "Naresh More", brand="Nexlev",
+             check_results={"title": "REVIEW", "colour": "Not Sure", "packer": "Yes"})
+check("Yes/No survive a stale Done; a real answer still fills REVIEW",
+      decisions_of("B0TEST0002"), {"title": "Yes", "colour": "No", "packer": "Yes"})
+db.mark_done("B0TEST0002", "Naresh More", brand="Nexlev",
+             check_results={"title": "No"})
+check("a real change of answer still wins", decisions_of("B0TEST0002")["title"], "No")
+check("only_fill replaces a non-answer with a real answer",
+      db.merge_answers({"a": "REVIEW", "b": "Yes"}, {"a": "Yes", "b": "No"}, True),
+      {"a": "Yes", "b": "Yes"})
+check("only_fill never puts Not Sure over REVIEW",
+      db.merge_answers({"a": "REVIEW"}, {"a": "Not Sure"}, True), {"a": "REVIEW"})
+
 print("history keeps the text too")
 rows = db.validation_history("B0TEST0001") if hasattr(db, "validation_history") else None
 if rows is None:

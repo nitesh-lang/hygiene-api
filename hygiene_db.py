@@ -432,6 +432,20 @@ def init_validations():
 # Keys inside check_results that are NOT check decisions.
 RESERVED_KEYS = ("comments", "verified", "stock")
 
+# A validator's real answers. Everything else stored against a check ("Not Sure",
+# or the auto status REVIEW / PASS / FAIL that Done writes for an unanswered
+# check) means nobody has answered it yet.
+REAL_ANSWERS = ("Yes", "No")
+
+
+def keep_real_answers(stored, incoming):
+    """Drop the incoming values that would replace a stored Yes/No with a
+    non-answer. A browser showing a stale "Not Sure" used to press Done and turn
+    a teammate's saved Yes into REVIEW (Nexlev / Audio Array, 2026-09)."""
+    stored = stored or {}
+    return {k: v for k, v in (incoming or {}).items()
+            if not (stored.get(k) in REAL_ANSWERS and v not in REAL_ANSWERS)}
+
 # The listing's stock status, picked from the dropdown above the checks and
 # stored under the reserved "stock" key. Absent = never picked (treated as Active).
 STOCK_VALUES = ("Active", "Out of stock")
@@ -494,7 +508,9 @@ def merge_answers(existing, incoming, only_fill=False):
         if not isinstance(v, str) or k in RESERVED_KEYS:
             continue
         if only_fill:
-            if v.strip() and k not in out:
+            # Fill a gap, or a non-answer with a real Yes/No; never change a real one.
+            if v.strip() and (k not in out or
+                              (out[k] not in REAL_ANSWERS and v in REAL_ANSWERS)):
                 out[k] = v
         elif v.strip():
             out[k] = v
@@ -796,7 +812,9 @@ def mark_done(asin, validated_by, check_results=None, notes=None, brand=""):
         notes = stored_notes(asin)
     # Answers sent with Done win, but one the payload doesn't mention — say an
     # answer autosaved from another PC — is kept rather than dropped.
-    record = {**split_check_results(stored)[0], **decisions}
+    # A non-answer (Not Sure / REVIEW / PASS / FAIL) never replaces a stored Yes/No.
+    stored_answers = split_check_results(stored)[0]
+    record = {**stored_answers, **keep_real_answers(stored_answers, decisions)}
     if comments:
         record["comments"] = comments
     if ticks:
