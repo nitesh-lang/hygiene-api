@@ -49,11 +49,10 @@ import hygiene_db as db
 app = FastAPI(title="Hygiene Validator API", version="1.0")
 
 # ── AUTH ─────────────────────────────────────────────────────────────────────
-# Every data route requires the shared key in the `x-api-key` header. Set it on
-# Render:  API_KEY=<same value the frontend's VITE_API_KEY uses>.
-# Fail-open ONLY while API_KEY is unset, so deploying this code BEFORE you set the
-# env var can't lock anyone out — but the API is NOT protected until API_KEY is set.
-API_KEY = os.environ.get("API_KEY", "").strip()
+# Every data route requires a signed-in user's bearer token (from /login).
+# The old shared `x-api-key` is no longer accepted anywhere: it was built into
+# the browser bundle, so anyone who opened the site could read it and use the
+# whole API without signing in. An API_KEY env var left on Render is ignored.
 # Never require auth. /login MUST be here — it is how a caller obtains
 # credentials in the first place, so gating it behind them locks everyone out.
 _OPEN_PATHS = {"/", "/health", "/login"}
@@ -70,26 +69,16 @@ async def require_api_key(request: Request, call_next):
         return await call_next(request)
     if request.url.path in _OPEN_PATHS:       # health checks must stay open for Render
         return await call_next(request)
-    # A signed-in user's bearer token is accepted anywhere the shared key is.
-    # Both are allowed during the migration off the in-bundle key so the browser
-    # can switch to tokens without a flag-day that locks the team out; once no
-    # client sends x-api-key, unset API_KEY and only tokens will work.
-    #
-    # Deny by default. This used to fall through to call_next() whenever API_KEY
-    # was empty, so an unset or mistyped env var silently published the entire
-    # database to anyone who knew the URL. Now a caller must present something
-    # valid, and clearing API_KEY tightens the API instead of opening it.
+    # Deny by default: only a valid, unexpired session token gets through.
     token = _bearer(request)
     if token and db.session_user(token):
-        return await call_next(request)
-    if API_KEY and request.headers.get("x-api-key") == API_KEY:
         return await call_next(request)
     return JSONResponse({"error": "unauthorized"}, status_code=401)
 
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 # Lock to your frontend origin:  ALLOWED_ORIGINS="https://your-validator.onrender.com"
-# allow_credentials is now False (we authenticate with a header key, not cookies),
+# allow_credentials is now False (we authenticate with a bearer header, not cookies),
 # which also closes the previous reflect-ANY-origin-with-credentials hole.
 # Added AFTER the auth middleware so CORS is the OUTERMOST layer: preflight is
 # answered correctly and even a 401 response still carries CORS headers.
